@@ -210,6 +210,23 @@ transforms:
         #   rules:
         #     - host: "api.openai.com"
 
+  # Header allowlist: strips any request header not listed below before the
+  # request goes upstream. Default-deny — every header must either match a
+  # literal name (case-insensitive) or a /regex/ pattern. Place this AFTER
+  # transforms that inject headers (e.g. secrets) so injected headers survive.
+  # - name: header_allowlist
+  #   config:
+  #     headers:
+  #       - "Authorization"
+  #       - "Content-Type"
+  #       - "User-Agent"
+  #       - "Accept"
+  #       - "/^X-Trace-.*$/"
+  #     # Optional rules limit the allowlist to specific hosts/methods/paths.
+  #     # Omit for all requests.
+  #     rules:
+  #       - host: "api.openai.com"
+
   # gRPC transforms: each entry delegates to one external TransformService server.
   # Use multiple entries for multiple servers; they run in pipeline order.
   - name: grpc

@@ -312,6 +312,43 @@ transforms:
           headers: ["x-request-id"]
 ```
 
+### Header allowlist
+
+Default-deny request header filter. Any request header whose canonical name is
+not in the configured `headers` list is stripped before the request goes
+upstream. Useful for blocking tracking, fingerprinting, or accidental leakage
+headers (cookies, internal correlation IDs, `X-Forwarded-*`, etc.) that the
+sandbox might attach.
+
+Entries are matched case-insensitively against the canonical header name.
+Patterns delimited by `/.../` (e.g. `/^X-Trace-.*$/`) are case-insensitive
+regular expressions, mirroring the `secrets` transform's `match_headers`
+syntax.
+
+Optional `rules` limit the allowlist to specific hosts/methods/paths. When
+omitted, the allowlist applies to every request that reaches this transform.
+
+When at least one header is stripped, the trace is annotated with
+`stripped_headers` listing the removed names.
+
+> **Placement:** put `header_allowlist` *after* `secrets` (so injected
+> credentials are not stripped if not in the allowlist, you can list them) and
+> *after* `annotate` (so annotation reads the original headers).
+
+```yaml
+transforms:
+  - name: header_allowlist
+    config:
+      headers:
+        - "Authorization"
+        - "Content-Type"
+        - "User-Agent"
+        - "Accept"
+        - "/^X-Trace-.*$/"
+      rules:
+        - host: "api.openai.com"
+```
+
 ### Secrets
 
 The sandbox never holds real credentials. Instead:
