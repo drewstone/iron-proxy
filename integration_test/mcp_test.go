@@ -37,16 +37,19 @@ func TestMCPPolicy(t *testing.T) {
 		_ = json.Unmarshal([]byte(body), &msg)
 
 		// Switch on a hint header so the test can ask for SSE responses.
+		// Write errors are ignored: this is a fixture HTTP handler running in
+		// a background goroutine, and a broken client connection cannot be
+		// surfaced from here anyway.
 		if r.Header.Get("X-Test-Response") == "sse" {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)
 			flusher, _ := w.(http.Flusher)
 			payload := buildToolsListPayload(msg.ID)
-			fmt.Fprintf(w, "event: message\ndata: %s\n\n", payload)
+			_, _ = fmt.Fprintf(w, "event: message\ndata: %s\n\n", payload)
 			if flusher != nil {
 				flusher.Flush()
 			}
-			fmt.Fprint(w, ": keepalive\n\n")
+			_, _ = fmt.Fprint(w, ": keepalive\n\n")
 			if flusher != nil {
 				flusher.Flush()
 			}
@@ -59,7 +62,7 @@ func TestMCPPolicy(t *testing.T) {
 		case "tools/list":
 			_, _ = w.Write([]byte(buildToolsListPayload(msg.ID)))
 		default:
-			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}`, idOrNull(msg.ID))
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}`, idOrNull(msg.ID))
 		}
 	}))
 	t.Cleanup(upstream.Close)
