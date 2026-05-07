@@ -13,6 +13,11 @@ import (
 	"github.com/ironsh/iron-proxy/internal/transform"
 )
 
+const (
+	mediaTypeJSON = "application/json"
+	mediaTypeSSE  = "text/event-stream"
+)
+
 // mediaTypeIs reports whether ct names the given media type, ignoring case
 // and any parameters (e.g. "; charset=utf-8"). RFC 7231 §3.1.1.1 requires
 // case-insensitive comparison of type and subtype.
@@ -48,7 +53,7 @@ func (p *Policy) EvaluateRequest(server *Server, req *http.Request, trace *Trace
 	if req.Method != http.MethodPost {
 		return nil, nil
 	}
-	if !mediaTypeIs(req.Header.Get("Content-Type"), "application/json") {
+	if !mediaTypeIs(req.Header.Get("Content-Type"), mediaTypeJSON) {
 		return nil, nil
 	}
 
@@ -62,16 +67,15 @@ func (p *Policy) EvaluateRequest(server *Server, req *http.Request, trace *Trace
 	}
 	bb.Reset()
 
-	// Detect oversize: if the upstream Content-Length exceeded the buffered
-	// body cap, the read returned a truncated body. We cannot reliably parse
-	// JSON-RPC in that case, so deny.
+	// If the upstream Content-Length exceeded the buffered body cap, the
+	// read returned a truncated body and we cannot reliably parse JSON-RPC.
 	if req.ContentLength > 0 && int64(len(body)) < req.ContentLength {
 		trace.Append(Message{
 			Direction: DirectionRequest,
 			Decision:  DecisionDeny,
 			Reason:    ReasonOversizeBody,
 		})
-		return p.errorResponse(req, nil, false), nil
+		return p.policyErrorResponse(req, nil, false)
 	}
 
 	msgs, isBatch, err := decodeJSONRPC(body)
@@ -81,7 +85,7 @@ func (p *Policy) EvaluateRequest(server *Server, req *http.Request, trace *Trace
 			Decision:  DecisionDeny,
 			Reason:    ReasonMalformedJSONRPC,
 		})
-		return p.errorResponse(req, nil, isBatch), nil
+		return p.policyErrorResponse(req, nil, isBatch)
 	}
 
 	denyAny := false
@@ -107,10 +111,6 @@ func (p *Policy) EvaluateRequest(server *Server, req *http.Request, trace *Trace
 				denyAny = true
 			}
 		case MethodToolsList:
-			// Record the request id so the response wrapper knows this
-			// specific response is the one whose tools array should be
-			// filtered. Other JSON-RPC results that happen to contain a
-			// tools array are left alone.
 			trace.recordToolsListID(m.ID)
 		}
 		trace.Append(entry)
@@ -119,53 +119,37 @@ func (p *Policy) EvaluateRequest(server *Server, req *http.Request, trace *Trace
 	if !denyAny {
 		return nil, nil
 	}
-
-	if isBatch {
-		body, err := batchErrorResponseBody(ids, p.errorCode, p.errorMessage)
-		if err != nil {
-			return nil, fmt.Errorf("mcp: building batch error response: %w", err)
-		}
-		return jsonRPCResponse(req, body), nil
-	}
-	body2, err := errorResponseBody(ids[0], p.errorCode, p.errorMessage)
-	if err != nil {
-		return nil, fmt.Errorf("mcp: building error response: %w", err)
-	}
-	return jsonRPCResponse(req, body2), nil
+	return p.policyErrorResponse(req, ids, isBatch)
 }
 
-// errorResponse builds a synthetic JSON-RPC error envelope to return when a
-// request is denied without per-item ids (malformed/oversize cases).
-func (p *Policy) errorResponse(req *http.Request, _ json.RawMessage, isBatch bool) *http.Response {
+// policyErrorResponse builds the synthetic JSON-RPC error envelope returned
+// to the agent on policy denial. Single (isBatch=false) returns one error
+// object using ids[0] (or null when ids is empty); batch returns an array of
+// error objects, one per id.
+func (p *Policy) policyErrorResponse(req *http.Request, ids []json.RawMessage, isBatch bool) (*http.Response, error) {
 	var body []byte
 	var err error
 	if isBatch {
-		body, err = batchErrorResponseBody([]json.RawMessage{nil}, p.errorCode, p.errorMessage)
+		if len(ids) == 0 {
+			ids = []json.RawMessage{nil}
+		}
+		body, err = batchErrorResponseBody(ids, p.errorCode, p.errorMessage)
 	} else {
-		body, err = errorResponseBody(nil, p.errorCode, p.errorMessage)
+		var id json.RawMessage
+		if len(ids) > 0 {
+			id = ids[0]
+		}
+		body, err = errorResponseBody(id, p.errorCode, p.errorMessage)
 	}
 	if err != nil {
-		// Should not happen — fall back to a plain 403.
-		return &http.Response{
-			StatusCode: http.StatusForbidden,
-			Status:     "403 Forbidden",
-			Proto:      "HTTP/1.1",
-			ProtoMajor: 1, ProtoMinor: 1,
-			Header:        http.Header{"Content-Type": {"text/plain"}},
-			Body:          http.NoBody,
-			Request:       req,
-			ContentLength: 0,
-		}
+		return nil, fmt.Errorf("mcp: building policy error response: %w", err)
 	}
-	return jsonRPCResponse(req, body)
+	return jsonRPCResponse(req, body), nil
 }
 
-// jsonRPCResponse wraps a JSON-RPC response body in an http.Response. The
-// proxy's writeResponse copies headers and body so we always return 200 OK
-// with application/json — JSON-RPC errors are encoded inside the envelope.
 func jsonRPCResponse(req *http.Request, body []byte) *http.Response {
 	hdr := http.Header{}
-	hdr.Set("Content-Type", "application/json")
+	hdr.Set("Content-Type", mediaTypeJSON)
 	hdr.Set("Content-Length", strconv.Itoa(len(body)))
 	return &http.Response{
 		StatusCode:    http.StatusOK,
@@ -181,26 +165,32 @@ func jsonRPCResponse(req *http.Request, body []byte) *http.Response {
 }
 
 // WrapResponseBody installs the response-side filter for an MCP-matched
-// response. The returned body must replace resp.Body before the proxy's
+// response. The returned body replaces resp.Body before the proxy's
 // streaming or buffered writeResponse path runs.
 //
 // Behavior depends on Content-Type:
 //   - application/json: read and decode the full body, filter tools/list
 //     results, re-marshal, return a NewBufferedBodyFromBytes wrapper.
-//   - text/event-stream: return a streaming reader that scans events as they
+//   - text/event-stream: return a streaming filter that scans events as they
 //     arrive, decodes the data payload as JSON-RPC, filters tools/list result
 //     payloads, and re-emits the event. Other event shapes pass through.
-//   - anything else: returns the original body unchanged.
+//   - anything else: return the original body unchanged.
+//
+// When body is a *transform.BufferedBody on the SSE path, the filter reads
+// through to the underlying upstream reader rather than the BufferedBody
+// itself; otherwise the BufferedBody's eager io.ReadAll on first Read would
+// block forever on a long-lived MCP listener stream.
 func (p *Policy) WrapResponseBody(server *Server, contentType string, body io.ReadCloser, trace *Trace) (io.ReadCloser, error) {
 	if p == nil || server == nil {
 		return body, nil
 	}
 	allowed := server.AllowedToolNames()
 
-	if mediaTypeIs(contentType, "text/event-stream") {
-		return newSSEFilter(body, allowed, trace), nil
+	if mediaTypeIs(contentType, mediaTypeSSE) {
+		inner := unwrapBufferedBody(body)
+		return transform.NewBufferedBody(newSSEFilter(inner, allowed, trace), 0), nil
 	}
-	if !mediaTypeIs(contentType, "application/json") {
+	if !mediaTypeIs(contentType, mediaTypeJSON) {
 		return body, nil
 	}
 
@@ -215,10 +205,24 @@ func (p *Policy) WrapResponseBody(server *Server, contentType string, body io.Re
 
 	filtered, err := filterJSONResponseBody(raw, allowed, trace)
 	if err != nil {
-		// On filter failure, pass the original body through untouched.
 		return transform.NewBufferedBodyFromBytes(raw), nil
 	}
 	return transform.NewBufferedBodyFromBytes(filtered), nil
+}
+
+// unwrapBufferedBody returns an io.ReadCloser that reads directly from the
+// upstream reader when body is a *transform.BufferedBody. The returned
+// closer routes through the BufferedBody so the upstream connection is
+// freed when the filter is closed.
+func unwrapBufferedBody(body io.ReadCloser) io.ReadCloser {
+	bb, ok := body.(*transform.BufferedBody)
+	if !ok {
+		return body
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{Reader: bb.StreamingReader(), Closer: bb}
 }
 
 // filterJSONResponseBody filters tools/list responses inside a non-streaming
@@ -305,10 +309,10 @@ func appendResponseAudit(trace *Trace, msg rpcMessage, filtered int) {
 	trace.Append(entry)
 }
 
-// sseFilter streams SSE events from upstream, filters JSON-RPC payloads, and
-// re-emits the events to the client. It implements io.ReadCloser. Reads are
-// driven by the proxy's streamSSE flush loop — each call returns enough bytes
-// to make forward progress; we buffer at most one rewritten event at a time.
+// sseFilter streams SSE events from upstream, filters JSON-RPC payloads,
+// and re-emits the events to the client. Reads are driven by the proxy's
+// streamSSE flush loop; each Read consumes one upstream event and copies
+// the rewritten (or pass-through) bytes into the caller's buffer.
 type sseFilter struct {
 	upstream io.ReadCloser
 	br       *bufio.Reader
@@ -328,59 +332,48 @@ func newSSEFilter(upstream io.ReadCloser, allowed map[string]bool, trace *Trace)
 }
 
 func (f *sseFilter) Read(p []byte) (int, error) {
-	if len(f.pending) > 0 {
-		n := copy(p, f.pending)
-		f.pending = f.pending[n:]
-		return n, nil
-	}
-	if f.done {
-		return 0, io.EOF
-	}
-	ev, err := readSSEEvent(f.br)
-	if ev != nil {
-		f.handleEvent(ev)
-	}
-	if err != nil {
-		f.done = true
-		if err == io.EOF && len(f.pending) > 0 {
-			// Flush trailing buffered bytes before EOF.
-			n := copy(p, f.pending)
-			f.pending = f.pending[n:]
-			if len(f.pending) == 0 {
-				return n, io.EOF
-			}
-			return n, nil
-		}
-		if err != io.EOF {
-			return 0, err
-		}
-		if len(f.pending) == 0 {
+	for len(f.pending) == 0 {
+		if f.done {
 			return 0, io.EOF
 		}
-	}
-	if len(f.pending) == 0 {
-		return 0, nil
+		ev, err := readSSEEvent(f.br)
+		if ev != nil {
+			f.pending = append(f.pending, f.rewriteEvent(ev)...)
+		}
+		if err != nil {
+			f.done = true
+			if err != io.EOF {
+				if len(f.pending) == 0 {
+					return 0, err
+				}
+				// Yield buffered bytes first; the next Read returns EOF.
+				break
+			}
+		}
 	}
 	n := copy(p, f.pending)
 	f.pending = f.pending[n:]
+	if len(f.pending) == 0 {
+		f.pending = nil
+	}
 	return n, nil
 }
 
-func (f *sseFilter) handleEvent(ev *sseEvent) {
+// rewriteEvent returns the bytes to emit for ev — the rewritten event when a
+// tools/list result was filtered, or ev.raw verbatim for everything else
+// (heartbeats, comments, non-JSON payloads, unrelated JSON-RPC messages).
+func (f *sseFilter) rewriteEvent(ev *sseEvent) []byte {
 	payload := ev.dataPayload()
 	if len(payload) == 0 {
-		f.pending = append(f.pending, ev.raw...)
-		return
+		return ev.raw
 	}
 	trimmed := bytes.TrimSpace(payload)
 	if len(trimmed) == 0 || (trimmed[0] != '{' && trimmed[0] != '[') {
-		f.pending = append(f.pending, ev.raw...)
-		return
+		return ev.raw
 	}
 	var msg rpcMessage
 	if err := json.Unmarshal(trimmed, &msg); err != nil {
-		f.pending = append(f.pending, ev.raw...)
-		return
+		return ev.raw
 	}
 	removed := 0
 	if f.trace.isToolsListResponse(msg.ID) {
@@ -388,15 +381,13 @@ func (f *sseFilter) handleEvent(ev *sseEvent) {
 	}
 	appendResponseAudit(f.trace, msg, removed)
 	if removed == 0 {
-		f.pending = append(f.pending, ev.raw...)
-		return
+		return ev.raw
 	}
 	newPayload, err := json.Marshal(msg)
 	if err != nil {
-		f.pending = append(f.pending, ev.raw...)
-		return
+		return ev.raw
 	}
-	f.pending = append(f.pending, ev.rewriteData(newPayload)...)
+	return ev.rewriteData(newPayload)
 }
 
 func (f *sseFilter) Close() error {

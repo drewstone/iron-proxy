@@ -33,8 +33,7 @@ type Message struct {
 	Filtered int `json:"filtered,omitempty"`
 }
 
-// Append records a message on the trace under a lock so concurrent streamed
-// SSE writes do not race.
+// Append records a message on the trace.
 func (t *Trace) Append(m Message) {
 	if t == nil {
 		return

@@ -93,6 +93,10 @@ type Server struct {
 	Name  string
 	rules []hostmatch.Rule
 	tools map[string]*Tool
+	// allowedNames is the set of tool names allowed on this server, derived
+	// from tools at compile time. Cached so the response-side filter does
+	// not rebuild the map on every response.
+	allowedNames map[string]bool
 }
 
 // Tool is a compiled tool allowlist entry with optional argument constraints.
@@ -140,9 +144,10 @@ func Compile(c Config) (*Policy, error) {
 		}
 
 		s := &Server{
-			Name:  sc.Name,
-			rules: rules,
-			tools: make(map[string]*Tool, len(sc.Tools)),
+			Name:         sc.Name,
+			rules:        rules,
+			tools:        make(map[string]*Tool, len(sc.Tools)),
+			allowedNames: make(map[string]bool, len(sc.Tools)),
 		}
 
 		for j, tc := range sc.Tools {
@@ -157,6 +162,7 @@ func Compile(c Config) (*Policy, error) {
 				return nil, err
 			}
 			s.tools[tc.Name] = &Tool{Name: tc.Name, clauses: clauses}
+			s.allowedNames[tc.Name] = true
 		}
 
 		p.servers = append(p.servers, s)
@@ -165,10 +171,7 @@ func Compile(c Config) (*Policy, error) {
 	return p, nil
 }
 
-// ErrorCode returns the configured JSON-RPC error code for policy denials.
-func (p *Policy) ErrorCode() int { return p.errorCode }
-
-// ErrorMessage returns the configured JSON-RPC error message for policy denials.
+func (p *Policy) ErrorCode() int       { return p.errorCode }
 func (p *Policy) ErrorMessage() string { return p.errorMessage }
 
 // MatchServer returns the first server whose rules match the request, or nil.
@@ -187,14 +190,10 @@ func (p *Policy) MatchServer(req *http.Request) *Server {
 	return nil
 }
 
-// AllowedToolNames returns the set of tool names allowed on this server, used
-// for tools/list response filtering.
+// AllowedToolNames returns the precompiled set of tool names allowed on this
+// server. The map is shared (not copied) and must not be mutated.
 func (s *Server) AllowedToolNames() map[string]bool {
-	names := make(map[string]bool, len(s.tools))
-	for n := range s.tools {
-		names[n] = true
-	}
-	return names
+	return s.allowedNames
 }
 
 // EvaluateTool checks whether a tool call is allowed under this server's

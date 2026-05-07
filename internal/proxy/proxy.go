@@ -407,22 +407,16 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 	result.StatusCode = finalResp.StatusCode
 
 	// MCP response wrapping: filter tools/list payloads and other JSON-RPC
-	// messages on streams from a matched MCP server.
+	// messages on streams from a matched MCP server. WrapResponseBody
+	// returns a *transform.BufferedBody (or the original body untouched)
+	// so the proxy's streamSSE/writeResponse paths can consume it directly.
 	if mcpServer != nil && p.mcpPolicy != nil {
 		ct := finalResp.Header.Get("Content-Type")
-		// The wrapper consumes the upstream BufferedBody. The proxy's
-		// streamSSE/writeResponse paths require a *transform.BufferedBody,
-		// so we re-wrap whatever the policy returns.
-		original := finalResp.Body
-		wrapped, err := p.mcpPolicy.WrapResponseBody(mcpServer, ct, original, mcpTrace)
+		wrapped, err := p.mcpPolicy.WrapResponseBody(mcpServer, ct, finalResp.Body, mcpTrace)
 		if err != nil {
 			p.logger.Warn("mcp response wrap error", slog.String("error", err.Error()))
-		} else if wrapped != nil && wrapped != original {
-			if _, isBuffered := wrapped.(*transform.BufferedBody); isBuffered {
-				finalResp.Body = wrapped
-			} else {
-				finalResp.Body = transform.NewBufferedBody(wrapped, 0)
-			}
+		} else if wrapped != nil {
+			finalResp.Body = wrapped
 		}
 	}
 
