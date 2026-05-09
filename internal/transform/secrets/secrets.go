@@ -57,9 +57,8 @@ type injectConfig struct {
 	Header     string `yaml:"header,omitempty"`
 	QueryParam string `yaml:"query_param,omitempty"`
 	Formatter  string `yaml:"formatter,omitempty"`
-	// Require, when true, rejects the request if the secret can't be
-	// resolved at the time the request matches. Default false skips the
-	// secret silently on resolve failure.
+	// Require rejects the request when the secret is unavailable. When
+	// false (default), an unavailable secret is skipped silently.
 	Require bool `yaml:"require,omitempty"`
 }
 

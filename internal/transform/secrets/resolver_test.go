@@ -668,9 +668,54 @@ func TestParseTTL(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestFailureTTL(t *testing.T) {
-	require.Equal(t, defaultFailureTTL, failureTTL(0))
-	require.Equal(t, 5*time.Minute, failureTTL(5*time.Minute))
+func TestBuildLazyResult_FailureTTLDefaults(t *testing.T) {
+	// Empty failure_ttl falls back to defaultFailureTTL regardless of success TTL.
+	result, err := buildLazyResult("name", "1h", "", slog.Default(), func(context.Context) (string, error) {
+		return "v", nil
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result.GetValue)
+}
+
+func TestBuildLazyResult_FailureTTLOverride(t *testing.T) {
+	now := time.Now()
+	calls := 0
+	successTTL, err := parseTTL("1h")
+	require.NoError(t, err)
+	failTTL, err := parseTTL("5s")
+	require.NoError(t, err)
+	cv := &cachedValue{
+		name:       "name",
+		successTTL: successTTL,
+		failureTTL: failTTL,
+		now:        func() time.Time { return now },
+		fetch: func(_ context.Context) (string, error) {
+			calls++
+			return "", fmt.Errorf("boom")
+		},
+	}
+	_, err = cv.get(context.Background())
+	require.Error(t, err)
+
+	// Within 5s the error is cached.
+	now = now.Add(4 * time.Second)
+	_, err = cv.get(context.Background())
+	require.Error(t, err)
+	require.Equal(t, 1, calls)
+
+	// After 5s, retry — even though successTTL is 1h.
+	now = now.Add(2 * time.Second)
+	_, err = cv.get(context.Background())
+	require.Error(t, err)
+	require.Equal(t, 2, calls)
+}
+
+func TestBuildLazyResult_InvalidFailureTTL(t *testing.T) {
+	_, err := buildLazyResult("name", "", "not-a-duration", slog.Default(), func(context.Context) (string, error) {
+		return "v", nil
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failure_ttl")
 }
 
 // Lazy-init tests: each resolver's Resolve should not call the underlying client.

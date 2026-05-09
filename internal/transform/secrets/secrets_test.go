@@ -25,13 +25,12 @@ import (
 )
 
 // fakeResolver is a test secretResolver. Resolve only validates that the
-// source has a recognizable name field; the actual lookup against secrets
-// (and any failure) is deferred to GetValue, mirroring lazy-init semantics.
+// source has a recognizable name field; the lookup against secrets (and any
+// failure) is deferred to GetValue.
 type fakeResolver struct {
-	mu          sync.Mutex
-	secrets     map[string]string // keyed by env var name or secret ID
-	failuresFor map[string]int    // remaining initial failures per name; decremented per fetch
-	fetchCalls  map[string]int    // per-name fetch call count for assertions
+	mu         sync.Mutex
+	secrets    map[string]string
+	fetchCalls map[string]int
 }
 
 func (f *fakeResolver) extractName(raw yaml.Node) (string, error) {
@@ -62,12 +61,6 @@ func (f *fakeResolver) Resolve(_ context.Context, raw yaml.Node) (ResolveResult,
 			f.fetchCalls = make(map[string]int)
 		}
 		f.fetchCalls[name]++
-		if f.failuresFor != nil {
-			if left := f.failuresFor[name]; left > 0 {
-				f.failuresFor[name] = left - 1
-				return "", &resolveError{name}
-			}
-		}
 		val, ok := f.secrets[name]
 		if !ok || val == "" {
 			return "", &resolveError{name}
@@ -1255,16 +1248,12 @@ func TestInject_ConcurrentSafety(t *testing.T) {
 
 // --- Lazy resolution + require-on-resolve-failure tests ---
 
-// missingSecretRegistry uses a fakeResolver with no secrets configured, so
-// every lazy fetch fails with "<name> not found".
 func missingSecretRegistry() resolverRegistry {
 	return resolverRegistry{
 		"env": &fakeResolver{secrets: map[string]string{}},
 	}
 }
 
-// missingSecretEntry returns a default replace entry whose source can never
-// be resolved (the fakeResolver has no value for MISSING).
 func missingSecretEntry(opts ...func(*secretEntry)) secretEntry {
 	e := secretEntry{
 		Source:       envSource("MISSING"),
@@ -1361,15 +1350,12 @@ func TestLazy_MixedAvailableAndUnavailable(t *testing.T) {
 		}},
 	}
 	cfg := secretsConfig{Secrets: []secretEntry{
-		// Working secret.
 		{
 			Source:       envSource("OPENAI_API_KEY"),
 			ProxyValue:   "proxy-openai-abc123",
 			MatchHeaders: []string{"Authorization"},
 			Rules:        []hostmatch.RuleConfig{{Host: "api.openai.com"}},
 		},
-		// Missing secret on a different host (so both rules can match a single req? no, they can't —
-		// use the same host so both match).
 		{
 			Source:       envSource("MISSING"),
 			ProxyValue:   "proxy-other",
@@ -1413,45 +1399,3 @@ func TestLazy_FailureCachedAcrossRequests(t *testing.T) {
 	require.Equal(t, 1, fr.fetchCalls["MISSING"])
 }
 
-func TestLazy_FailureRecoversAfterFix(t *testing.T) {
-	fr := &fakeResolver{
-		secrets:     map[string]string{"FLAKY": "real-flaky-value"},
-		failuresFor: map[string]int{"FLAKY": 1}, // first fetch fails, then succeeds
-	}
-	registry := resolverRegistry{"env": fr}
-
-	// Use a tiny TTL so failureTTL on the cachedValue is also tiny — we can
-	// drive recovery without sleeping by inspecting the cachedValue directly.
-	cfg := secretsConfig{Secrets: []secretEntry{{
-		Source:       envSource("FLAKY"),
-		ProxyValue:   "proxy-flaky",
-		MatchHeaders: []string{"Authorization"},
-		Rules:        []hostmatch.RuleConfig{{Host: "api.example.com"}},
-	}}}
-	s, err := newFromConfig(context.Background(), cfg, registry)
-	require.NoError(t, err)
-
-	// First request: fetch fails, header untouched.
-	req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
-	req.Host = "api.example.com"
-	req.Header.Set("Authorization", "Bearer proxy-flaky")
-	doTransform(t, s, req)
-	require.Equal(t, "Bearer proxy-flaky", req.Header.Get("Authorization"))
-
-	// Force the cachedValue to expire so the next call re-fetches.
-	require.Len(t, s.secrets, 1)
-	// Reach into the test fakeResolver call counts to confirm only 1 fetch happened.
-	fr.mu.Lock()
-	require.Equal(t, 1, fr.fetchCalls["FLAKY"])
-	fr.mu.Unlock()
-
-	// Second request right after: still within failureTTL, no new fetch.
-	req = httptest.NewRequest("GET", "http://api.example.com/v1", nil)
-	req.Host = "api.example.com"
-	req.Header.Set("Authorization", "Bearer proxy-flaky")
-	doTransform(t, s, req)
-	require.Equal(t, "Bearer proxy-flaky", req.Header.Get("Authorization"))
-	fr.mu.Lock()
-	require.Equal(t, 1, fr.fetchCalls["FLAKY"], "still cached")
-	fr.mu.Unlock()
-}

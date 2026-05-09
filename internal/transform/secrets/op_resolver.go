@@ -30,10 +30,11 @@ type opResolver struct {
 }
 
 type opConfig struct {
-	Type      string `yaml:"type"`
-	SecretRef string `yaml:"secret_ref"`
-	TokenEnv  string `yaml:"token_env,omitempty"`
-	TTL       string `yaml:"ttl,omitempty"`
+	Type       string `yaml:"type"`
+	SecretRef  string `yaml:"secret_ref"`
+	TokenEnv   string `yaml:"token_env,omitempty"`
+	TTL        string `yaml:"ttl,omitempty"`
+	FailureTTL string `yaml:"failure_ttl,omitempty"`
 }
 
 func newOPResolver(logger *slog.Logger) *opResolver {
@@ -68,17 +69,9 @@ func (r *opResolver) Resolve(_ context.Context, raw yaml.Node) (ResolveResult, e
 	if cfg.TokenEnv == "" {
 		cfg.TokenEnv = defaultOPTokenEnv
 	}
-	successTTL, err := parseTTL(cfg.TTL)
-	if err != nil {
-		return ResolveResult{}, fmt.Errorf("parsing ttl %q: %w", cfg.TTL, err)
-	}
-	fetch := func(ctx context.Context) (string, error) {
+	return buildLazyResult(cfg.SecretRef, cfg.TTL, cfg.FailureTTL, r.logger, func(ctx context.Context) (string, error) {
 		return r.fetchSecret(ctx, cfg)
-	}
-	return ResolveResult{
-		Name:     cfg.SecretRef,
-		GetValue: newLazyValue(cfg.SecretRef, successTTL, failureTTL(successTTL), r.logger, fetch),
-	}, nil
+	})
 }
 
 func (r *opResolver) fetchSecret(ctx context.Context, cfg opConfig) (string, error) {
