@@ -38,7 +38,10 @@ type sourceTypeHint struct {
 // sourceBuilderRegistry maps source type names to their builders.
 type sourceBuilderRegistry map[string]secretSourceBuilder
 
-const defaultFailureTTL = time.Minute
+const (
+	defaultFailureTTL = time.Minute
+	fetchTimeout      = 30 * time.Second
+)
 
 func parseTTL(s string) (time.Duration, error) {
 	if s == "" {
@@ -319,7 +322,11 @@ func (cv *cachedValue) Get(ctx context.Context) (string, error) {
 		return "", cv.lastErr
 	}
 
-	val, err := cv.fetch(ctx)
+	// Detach from the caller's context so a single client cancellation can't
+	// poison the failure cache for unrelated requests.
+	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), fetchTimeout)
+	defer cancel()
+	val, err := cv.fetch(fetchCtx)
 	if err != nil {
 		if cv.initialized {
 			cv.expiresAt = cv.now().Add(cv.successTTL / 2)

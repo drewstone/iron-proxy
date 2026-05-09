@@ -635,6 +635,22 @@ func TestCachedValue_FailureRecovers(t *testing.T) {
 	require.Equal(t, 2, calls)
 }
 
+func TestCachedValue_CallerContextCancellationDoesNotPropagate(t *testing.T) {
+	cv := newLazyValue("test", 0, time.Minute, slog.Default(), func(ctx context.Context) (string, error) {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		return "value", nil
+	})
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	val, err := cv.Get(cancelled)
+	require.NoError(t, err)
+	require.Equal(t, "value", val)
+}
+
 func TestCachedValue_ZeroSuccessTTLCachesForever(t *testing.T) {
 	calls := 0
 	cv := &cachedValue{
