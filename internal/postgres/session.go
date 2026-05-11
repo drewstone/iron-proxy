@@ -14,22 +14,10 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
-// probeIterations is how many SELECT current_role probes the proxy runs in
-// separate autocommit Simple Queries after issuing SET ROLE upstream. Each
-// probe must return the configured role; any mismatch means PgBouncer is
-// silently swapping backends between queries (non-session pool mode) and the
-// proxy refuses to enter the relay loop.
-//
-// In session mode the role always sticks, so all probes pass. In transaction
-// or statement mode the role may stick across some queries by chance but a
-// single mismatch is conclusive. Five iterations balances startup-time cost
-// against detection probability.
-const probeIterations = 5
-
 // runSession owns a single client connection from accept through close. It
 // performs the proxy-side handshake under a deadline, opens an upstream
-// connection through pgconn, injects SET ROLE and probes for session-pool
-// behavior, hijacks the connection, then runs the bidirectional relay loop.
+// connection through pgconn, issues SET ROLE on the upstream session,
+// hijacks the connection, then runs the bidirectional relay loop.
 func runSession(ctx context.Context, clientConn net.Conn, policy *Policy, logger *slog.Logger) {
 	defer clientConn.Close()
 
@@ -62,9 +50,9 @@ func runSession(ctx context.Context, clientConn net.Conn, policy *Policy, logger
 		return
 	}
 
-	if err := setRoleAndProbe(ctx, upstream, policy); err != nil {
+	if err := setUpstreamRole(ctx, upstream, policy); err != nil {
 		writeFatal(backend, "08006", err.Error())
-		logger.Error("postgres: set role / probe failed",
+		logger.Error("postgres: set role failed",
 			slog.String("error", err.Error()),
 			slog.String("remote", clientConn.RemoteAddr().String()),
 		)
@@ -147,30 +135,17 @@ func dialUpstream(ctx context.Context, policy *Policy) (*pgconn.PgConn, error) {
 	return conn, nil
 }
 
-// setRoleAndProbe issues `SET ROLE "<role>"` on the upstream session and then
-// runs probeIterations separate autocommit `SELECT current_role` queries to
-// verify the role persists. Any probe returning a different role means the
-// upstream is rebinding backends between queries (PgBouncer in transaction or
-// statement pool mode), which silently nullifies the policy. Returns an error
-// in that case so the caller fails the client connection cleanly.
-func setRoleAndProbe(ctx context.Context, conn *pgconn.PgConn, policy *Policy) error {
+// setUpstreamRole issues `SET ROLE "<role>"` on the upstream session.
+//
+// The proxy assumes the role persists for the lifetime of the connection,
+// which requires PgBouncer (if present) to be running in session-pool mode.
+// Transaction or statement pool modes silently swap backends between queries
+// and would defeat the policy; that constraint is enforced by deployment
+// configuration rather than by a runtime probe — see docs/postgres.md.
+func setUpstreamRole(ctx context.Context, conn *pgconn.PgConn, policy *Policy) error {
 	setSQL := "SET ROLE " + QuoteIdent(policy.Role())
 	if _, err := conn.Exec(ctx, setSQL).ReadAll(); err != nil {
 		return fmt.Errorf("upstream rejected SET ROLE %s: %w", QuoteIdent(policy.Role()), err)
-	}
-
-	for i := 0; i < probeIterations; i++ {
-		results, err := conn.Exec(ctx, "SELECT current_role").ReadAll()
-		if err != nil {
-			return fmt.Errorf("probe SELECT current_role failed: %w", err)
-		}
-		if len(results) != 1 || len(results[0].Rows) != 1 || len(results[0].Rows[0]) != 1 {
-			return fmt.Errorf("probe SELECT current_role returned unexpected shape (got %d results)", len(results))
-		}
-		got := string(results[0].Rows[0][0])
-		if got != policy.Role() {
-			return fmt.Errorf("role did not persist between queries (saw %q, want %q) — upstream looks like PgBouncer in non-session pool mode; iron-proxy requires session pooling", got, policy.Role())
-		}
 	}
 	return nil
 }

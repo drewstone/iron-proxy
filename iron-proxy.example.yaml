@@ -319,18 +319,19 @@ transforms:
 # PostgreSQL MITM proxy. Listens for client connections, authenticates them
 # against proxy-managed credentials, opens its own authenticated connection to
 # the upstream database (handling MD5 / SCRAM-SHA-256 termination), then issues
-# `SET ROLE "<role>"` on the upstream session and verifies the role persists
-# across separate autocommit queries. Once the role is set, the relay is
+# `SET ROLE "<role>"` on the upstream session. From that point on the relay is
 # essentially transparent: clients use Postgres normally and every query they
 # issue runs as the configured role for identity-aware access (e.g. RLS).
 # When this block is omitted, no postgres listener runs.
 #
-# Deployment requirements:
-#  - PgBouncer (if used) must be in `pool_mode = session`. The proxy probes
-#    for this at connect time and refuses to enter the relay loop if the role
-#    doesn't stick between autocommit queries.
-#  - Clients must use simple-protocol or extended-protocol Postgres normally.
-#    Drivers do not need configuration changes.
+# !!! DEPLOYMENT REQUIREMENT !!!
+# If PgBouncer (or any pooler) sits between iron-proxy and PostgreSQL, it
+# MUST be configured with `pool_mode = session`. Transaction- or statement-
+# pool modes silently rebind backends between queries, which makes the role
+# we set on backend A invisible to the next query running on backend B —
+# defeating RLS without surfacing any error. This is not probed at runtime;
+# the constraint is enforced by deployment configuration. See docs/postgres.md
+# for the full rationale and verification instructions.
 #
 # What the proxy rejects from the client (with a synthetic ErrorResponse, so
 # the connection stays usable). All checks parse SQL with libpg_query and walk

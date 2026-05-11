@@ -4,12 +4,15 @@
 //
 // The listener accepts client connections, authenticates them against
 // proxy-managed credentials, opens its own authenticated connection upstream
-// (handling SCRAM/MD5 termination via pgconn), and then relays the PostgreSQL
-// wire protocol bidirectionally. Before handing control to the relay loop the
-// proxy issues a single `SET ROLE "<role>"` to the upstream and verifies the
-// role sticks across separate autocommit queries, which simultaneously sets
-// the policy and guards against PgBouncer pool modes that would silently
-// drop the role between queries (transaction / statement pooling).
+// (handling SCRAM/MD5 termination via pgconn), issues a single
+// `SET ROLE "<role>"` on the upstream session, then relays the PostgreSQL
+// wire protocol bidirectionally.
+//
+// Deployment assumption: if PgBouncer (or any pooler) sits between the proxy
+// and PostgreSQL, it must be configured in session-pool mode. Transaction or
+// statement pooling silently rebinds backends between queries and would
+// nullify the role injection. This is not probed at runtime — the constraint
+// is enforced by deployment configuration. See docs/postgres.md for details.
 //
 // While the relay is running the proxy is mostly transparent: it rejects only
 // client-issued role-changing statements (`SET ROLE`, `RESET ROLE`,
