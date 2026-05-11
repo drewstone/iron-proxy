@@ -1,18 +1,24 @@
 version: 2
 
+partial:
+  by: target
+
 builds:
   - main: ./cmd/iron-proxy
     binary: iron-proxy
     env:
-      - CGO_ENABLED=0
+      - CGO_ENABLED=1
     goos:
       - linux
       - darwin
     goarch:
       - amd64
       - arm64
+    tags:
+      - netgo
+      - osusergo
     ldflags:
-      - -s -w -X github.com/ironsh/iron-proxy/internal/version.Version={{.Version}}
+      - -s -w -X github.com/ironsh/iron-proxy/internal/version.Version={{.Version}} {{ if eq .Os "linux" }}-extldflags=-static{{ end }}
 
 archives:
   - formats: ["tar.gz"]
