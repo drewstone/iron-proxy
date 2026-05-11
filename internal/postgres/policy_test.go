@@ -1,6 +1,10 @@
 package postgres
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
 
 func TestClassifyClientStatement(t *testing.T) {
 	tests := []struct {
@@ -46,17 +50,11 @@ func TestClassifyClientStatement(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			allowed, reason := ClassifyClientStatement(tt.sql)
 			if tt.allowed {
-				if !allowed {
-					t.Fatalf("ClassifyClientStatement(%q) = (false, %v), want (true, _)", tt.sql, reason)
-				}
+				require.Truef(t, allowed, "ClassifyClientStatement(%q) returned (false, %v); want allowed", tt.sql, reason)
 				return
 			}
-			if allowed {
-				t.Fatalf("ClassifyClientStatement(%q) = (true, _), want (false, %v)", tt.sql, tt.reason)
-			}
-			if reason != tt.reason {
-				t.Fatalf("ClassifyClientStatement(%q) reason = %v, want %v", tt.sql, reason, tt.reason)
-			}
+			require.Falsef(t, allowed, "ClassifyClientStatement(%q) returned (true, _); want reject reason %v", tt.sql, tt.reason)
+			require.Equalf(t, tt.reason, reason, "ClassifyClientStatement(%q) reason", tt.sql)
 		})
 	}
 }
@@ -71,9 +69,6 @@ func TestQuoteIdent(t *testing.T) {
 		{"", `""`},
 	}
 	for _, c := range cases {
-		got := QuoteIdent(c.in)
-		if got != c.out {
-			t.Fatalf("QuoteIdent(%q) = %q, want %q", c.in, got, c.out)
-		}
+		require.Equalf(t, c.out, QuoteIdent(c.in), "QuoteIdent(%q)", c.in)
 	}
 }

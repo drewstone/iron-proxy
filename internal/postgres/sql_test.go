@@ -1,6 +1,10 @@
 package postgres
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
 
 func TestClassify(t *testing.T) {
 	tests := []struct {
@@ -79,9 +83,7 @@ func TestClassify(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			op := Classify(tt.sql)
-			if op.Kind != tt.want {
-				t.Fatalf("Classify(%q).Kind = %v, want %v", tt.sql, op.Kind, tt.want)
-			}
+			require.Equalf(t, tt.want, op.Kind, "Classify(%q).Kind", tt.sql)
 		})
 	}
 }
