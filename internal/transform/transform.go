@@ -118,6 +118,11 @@ type PipelineResult struct {
 	MCP MCPAudit
 
 	Err error
+
+	// ClientCanceled is set when the request ended because the client closed
+	// its connection (request context cancelled). Distinguishes "client went
+	// away" from real upstream/transform errors so dashboards stay clean.
+	ClientCanceled bool
 }
 
 // MCPAudit is the read-only view of the MCP interceptor's per-request audit

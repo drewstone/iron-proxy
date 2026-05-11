@@ -305,6 +305,12 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 
 	// Run request transforms
 	if rejectResp, err := pl.ProcessRequest(r.Context(), tctx, r, &result.RequestTransforms); err != nil {
+		if isClientCancel(r, err) {
+			result.Action = transform.ActionContinue
+			result.StatusCode = http.StatusOK
+			result.ClientCanceled = true
+			return
+		}
 		result.Action = transform.ActionContinue // error, not reject
 		result.StatusCode = http.StatusBadGateway
 		result.Err = err
@@ -330,6 +336,12 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 			result.MCP = mcpTrace
 			rejectResp, err := mcpPolicy.EvaluateRequest(s, r, mcpTrace)
 			if err != nil {
+				if isClientCancel(r, err) {
+					result.Action = transform.ActionContinue
+					result.StatusCode = http.StatusOK
+					result.ClientCanceled = true
+					return
+				}
 				result.Action = transform.ActionContinue
 				result.StatusCode = http.StatusBadGateway
 				result.Err = err
@@ -384,6 +396,12 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 
 	resp, err := p.doUpstream(upstreamReq)
 	if err != nil {
+		if isClientCancel(r, err) {
+			result.Action = transform.ActionContinue
+			result.StatusCode = http.StatusOK
+			result.ClientCanceled = true
+			return
+		}
 		result.Action = transform.ActionContinue
 		result.StatusCode = http.StatusBadGateway
 		result.Err = err
@@ -398,6 +416,12 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 	// Run response transforms
 	finalResp, err := pl.ProcessResponse(r.Context(), tctx, r, resp, &result.ResponseTransforms)
 	if err != nil {
+		if isClientCancel(r, err) {
+			result.Action = transform.ActionContinue
+			result.StatusCode = http.StatusOK
+			result.ClientCanceled = true
+			return
+		}
 		result.Action = transform.ActionContinue
 		result.StatusCode = http.StatusBadGateway
 		result.Err = err
@@ -633,6 +657,18 @@ func buildTransport(resolver *net.Resolver, guard *dnsguard.Guard, responseHeade
 
 func (p *Proxy) doUpstream(req *http.Request) (*http.Response, error) {
 	return p.transport.RoundTrip(req)
+}
+
+// isClientCancel reports whether err arose because the client closed its
+// connection (request context cancelled), rather than a real upstream or
+// transform failure. The canonical signal is the request context being
+// cancelled; we also accept errors.Is(err, context.Canceled) so a wrapped
+// sentinel from a transform that doesn't observe r.Context() still gets caught.
+func isClientCancel(r *http.Request, err error) bool {
+	if errors.Is(r.Context().Err(), context.Canceled) {
+		return true
+	}
+	return errors.Is(err, context.Canceled)
 }
 
 func copyHeaders(dst, src http.Header) {

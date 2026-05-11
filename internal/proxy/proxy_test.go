@@ -15,8 +15,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -263,6 +265,92 @@ func TestHTTPSProxy_SNIHostMismatch(t *testing.T) {
 	defer resp.Body.Close()
 
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestHTTPProxy_ClientCancel(t *testing.T) {
+	// Upstream that blocks on a release channel so the client has a window to
+	// cancel its context while the proxy is mid-RoundTrip.
+	release := make(chan struct{})
+	reached := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(reached)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	defer close(release)
+
+	pipeline := transform.NewPipeline(nil, transform.BodyLimits{}, testLogger())
+
+	var mu sync.Mutex
+	var results []transform.PipelineResult
+	done := make(chan struct{})
+	pipeline.SetAuditFunc(func(r *transform.PipelineResult) {
+		mu.Lock()
+		results = append(results, *r)
+		mu.Unlock()
+		close(done)
+	})
+
+	p := New(Options{
+		HTTPAddr: "127.0.0.1:0",
+		Pipeline: transform.NewPipelineHolder(pipeline),
+		Logger:   testLogger(),
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = p.httpServer.Serve(ln) }()
+	t.Cleanup(func() { _ = p.httpServer.Close() })
+	proxyAddr := ln.Addr().String()
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(&url.URL{Scheme: "http", Host: proxyAddr}),
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, "GET", upstream.URL+"/slow", nil)
+	require.NoError(t, err)
+
+	reqErr := make(chan error, 1)
+	go func() {
+		resp, err := client.Do(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		reqErr <- err
+	}()
+
+	// Wait for the proxy to reach upstream, then cancel.
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream never reached")
+	}
+	cancel()
+
+	select {
+	case err := <-reqErr:
+		require.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("client Do never returned")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("audit never fired")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, results, 1)
+	r := results[0]
+	require.True(t, r.ClientCanceled)
+	require.Equal(t, http.StatusOK, r.StatusCode)
+	require.NoError(t, r.Err)
+	require.Equal(t, transform.ActionContinue, r.Action)
 }
 
 func TestHTTPProxy_UpstreamError(t *testing.T) {

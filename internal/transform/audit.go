@@ -22,6 +22,9 @@ func NewAuditLogger(logger *slog.Logger) AuditFunc {
 		if result.Err != nil {
 			action = "error"
 		}
+		if result.ClientCanceled {
+			action = "client_cancel"
+		}
 
 		attrs := []any{
 			slog.Group("audit",
@@ -79,6 +82,8 @@ func NewAuditLogger(logger *slog.Logger) AuditFunc {
 		switch {
 		case result.Err != nil:
 			logger.Error("request", attrs...)
+		case result.ClientCanceled:
+			logger.Info("request", attrs...)
 		case result.Action == ActionReject:
 			logger.Warn("request", attrs...)
 		default:
