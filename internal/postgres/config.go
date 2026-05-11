@@ -12,7 +12,7 @@
 // and PostgreSQL, it must be configured in session-pool mode. Transaction or
 // statement pooling silently rebinds backends between queries and would
 // nullify the role injection. This is not probed at runtime — the constraint
-// is enforced by deployment configuration. See docs/postgres.md for details.
+// is enforced by deployment configuration.
 //
 // While the relay is running the proxy is mostly transparent: it rejects only
 // client-issued role-changing statements (`SET ROLE`, `RESET ROLE`,

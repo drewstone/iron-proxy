@@ -330,8 +330,7 @@ transforms:
 # pool modes silently rebind backends between queries, which makes the role
 # we set on backend A invisible to the next query running on backend B —
 # defeating RLS without surfacing any error. This is not probed at runtime;
-# the constraint is enforced by deployment configuration. See docs/postgres.md
-# for the full rationale and verification instructions.
+# the constraint is enforced by deployment configuration.
 #
 # What the proxy rejects from the client (with a synthetic ErrorResponse, so
 # the connection stays usable). All checks parse SQL with libpg_query and walk

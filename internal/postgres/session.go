@@ -141,7 +141,7 @@ func dialUpstream(ctx context.Context, policy *Policy) (*pgconn.PgConn, error) {
 // which requires PgBouncer (if present) to be running in session-pool mode.
 // Transaction or statement pool modes silently swap backends between queries
 // and would defeat the policy; that constraint is enforced by deployment
-// configuration rather than by a runtime probe — see docs/postgres.md.
+// configuration rather than by a runtime probe.
 func setUpstreamRole(ctx context.Context, conn *pgconn.PgConn, policy *Policy) error {
 	setSQL := "SET ROLE " + QuoteIdent(policy.Role())
 	if _, err := conn.Exec(ctx, setSQL).ReadAll(); err != nil {
