@@ -22,8 +22,9 @@ type proxyInstance struct {
 	HTTPAddr string
 	cmd      *exec.Cmd
 
-	addrsMu sync.Mutex
-	addrs   map[string]string
+	addrsMu     sync.Mutex
+	addrs       map[string]string
+	namedAddrs  map[string]string // key: msg+"|"+name (for log lines that include a name field, like postgres servers).
 }
 
 // AddrFor blocks until a JSON log line with the given "starting" msg has been
@@ -41,6 +42,29 @@ func (p *proxyInstance) AddrFor(t *testing.T, msg string) string {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for log line %q", msg)
+			return ""
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// AddrForNamed blocks until a JSON log line with the given "starting" msg and
+// name field has been observed and returns its addr. Used when multiple
+// services share a starting message (e.g. the postgres listener writes one
+// "postgres proxy starting" log line per configured server).
+func (p *proxyInstance) AddrForNamed(t *testing.T, msg, name string) string {
+	t.Helper()
+	key := msg + "|" + name
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		p.addrsMu.Lock()
+		addr, ok := p.namedAddrs[key]
+		p.addrsMu.Unlock()
+		if ok {
+			return addr
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for log line %q (name=%q)", msg, name)
 			return ""
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -71,8 +95,9 @@ func startProxy(t *testing.T, binary, cfgPath string, env []string) *proxyInstan
 	})
 
 	p := &proxyInstance{
-		cmd:   cmd,
-		addrs: make(map[string]string),
+		cmd:        cmd,
+		addrs:      make(map[string]string),
+		namedAddrs: make(map[string]string),
 	}
 
 	go scanLogs(stderrR, p)
@@ -88,6 +113,7 @@ func scanLogs(r io.Reader, p *proxyInstance) {
 	type logLine struct {
 		Msg  string `json:"msg"`
 		Addr string `json:"addr"`
+		Name string `json:"name"`
 	}
 
 	scanner := bufio.NewScanner(r)
@@ -104,7 +130,13 @@ func scanLogs(r io.Reader, p *proxyInstance) {
 			continue
 		}
 		p.addrsMu.Lock()
+		// Always record under the msg alone (last writer wins). Multi-listener
+		// services (e.g. postgres with N configured servers) should look up by
+		// (msg, name) via AddrForNamed instead.
 		p.addrs[entry.Msg] = entry.Addr
+		if entry.Name != "" {
+			p.namedAddrs[entry.Msg+"|"+entry.Name] = entry.Addr
+		}
 		p.addrsMu.Unlock()
 	}
 }

@@ -42,6 +42,15 @@ Single binary. Single YAML config.
   connections.
 - **CONNECT and SOCKS5 support.** Optional tunnel listener for tools that
   natively support proxy configuration via `HTTPS_PROXY` or SOCKS5 settings.
+- **PostgreSQL MITM proxy.** Optional listener that authenticates clients
+  against proxy-managed credentials, injects `SET ROLE` on the upstream
+  session, and rejects client attempts to mutate the role (`SET ROLE`,
+  `set_config('role', ...)`, DO blocks, etc.) via a SQL AST walk. Pairs with
+  PostgreSQL row-level security to give per-tenant data isolation when the
+  application connects as a shared service-account user. **Requires
+  PgBouncer (if used) to run in `pool_mode = session`** — transaction or
+  statement pool modes silently rebind backends between queries and would
+  defeat the policy. See [docs.iron.sh](https://docs.iron.sh) for details.
 
 Built for CI pipelines, GitHub Actions, AI agents (Claude Code, Cursor,
 Codex), and any environment where you run code you don't fully trust.

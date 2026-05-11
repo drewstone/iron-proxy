@@ -24,6 +24,7 @@ import (
 	"github.com/ironsh/iron-proxy/internal/mcp"
 	"github.com/ironsh/iron-proxy/internal/metrics"
 	iotel "github.com/ironsh/iron-proxy/internal/otel"
+	"github.com/ironsh/iron-proxy/internal/postgres"
 	"github.com/ironsh/iron-proxy/internal/proxy"
 	"github.com/ironsh/iron-proxy/internal/transform"
 	"github.com/ironsh/iron-proxy/internal/version"
@@ -199,6 +200,16 @@ func main() {
 		)
 	}
 
+	pgPolicies, err := postgres.LoadFromNode(cfg.Postgres)
+	if err != nil {
+		logger.Error("loading postgres config", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	pgServers := make([]*postgres.Server, 0, len(pgPolicies))
+	for _, p := range pgPolicies {
+		pgServers = append(pgServers, postgres.NewServer(p, logger))
+	}
+
 	// Initialize proxy.
 	p := proxy.New(proxy.Options{
 		HTTPAddr:                      cfg.Proxy.HTTPListen,
@@ -234,6 +245,10 @@ func main() {
 	go func() { errc <- fmt.Errorf("metrics: %w", metricsServer.ListenAndServe()) }()
 	if mgmtServer != nil {
 		go func() { errc <- fmt.Errorf("management: %w", mgmtServer.ListenAndServe()) }()
+	}
+	for _, pg := range pgServers {
+		pg := pg
+		go func() { errc <- fmt.Errorf("postgres[%s]: %w", pg.Name(), pg.ListenAndServe()) }()
 	}
 
 	startAttrs := []any{
@@ -284,6 +299,14 @@ func main() {
 	if mgmtServer != nil {
 		if err := mgmtServer.Shutdown(shutdownCtx); err != nil {
 			logger.Error("management server shutdown error", slog.String("error", err.Error()))
+		}
+	}
+	for _, pg := range pgServers {
+		if err := pg.Shutdown(shutdownCtx); err != nil {
+			logger.Error("postgres server shutdown error",
+				slog.String("name", pg.Name()),
+				slog.String("error", err.Error()),
+			)
 		}
 	}
 
