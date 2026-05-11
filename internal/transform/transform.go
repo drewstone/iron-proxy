@@ -118,6 +118,10 @@ type PipelineResult struct {
 	MCP MCPAudit
 
 	Err error
+
+	// ClientCanceled distinguishes client-initiated disconnect from a real
+	// failure so audit dashboards don't see phantom upstream errors.
+	ClientCanceled bool
 }
 
 // MCPAudit is the read-only view of the MCP interceptor's per-request audit

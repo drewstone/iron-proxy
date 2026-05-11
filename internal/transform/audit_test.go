@@ -152,6 +152,31 @@ func TestAudit_ErroredRequest(t *testing.T) {
 	require.Equal(t, float64(502), audit["status_code"])
 }
 
+func TestAudit_ClientCanceled(t *testing.T) {
+	result := &PipelineResult{
+		Host:           "api.openai.com",
+		Method:         "POST",
+		Path:           "/v1/chat/completions",
+		RemoteAddr:     "10.16.0.5:43215",
+		SNI:            "api.openai.com",
+		StartedAt:      time.Now(),
+		Duration:       3200 * time.Microsecond,
+		Action:         ActionContinue,
+		StatusCode:     200,
+		ClientCanceled: true,
+	}
+
+	parsed, raw := captureAuditLog(result)
+
+	require.Equal(t, "INFO", parsed["level"])
+	require.Equal(t, "request", parsed["msg"])
+	require.NotContains(t, raw, "\"error\"")
+
+	audit := parsed["audit"].(map[string]any)
+	require.Equal(t, "client_cancel", audit["action"])
+	require.Equal(t, float64(200), audit["status_code"])
+}
+
 func TestAudit_TransformTraceOrder(t *testing.T) {
 	result := &PipelineResult{
 		Host:       "example.com",
