@@ -351,22 +351,41 @@ transforms:
 #
 # Limitations: client→proxy TLS is not supported (SSLRequest is refused);
 # CancelRequest is not forwarded; one shared client credential (no per-user).
+#
+# The postgres key is a list, so one proxy process can front multiple
+# databases — each entry is an independent server with its own listen
+# address, upstream, credentials, and injected role. Server names must be
+# unique and are surfaced in logs to disambiguate.
 # postgres:
-#   listen: ":5432"
-#   upstream:
-#     host: "db.internal"
-#     port: 5432
-#     sslmode: "require"     # disable | require
-#     user_env: "PG_UPSTREAM_USER"
-#     password_env: "PG_UPSTREAM_PASSWORD"
-#     database: "appdb"
-#   client:
-#     # The single user clients must authenticate as when reaching the proxy.
-#     user: "app_user"
-#     password_env: "PG_PROXY_PASSWORD"
-#   # The Postgres role the proxy SETs at session start. Every query the client
-#   # issues runs as this role on the upstream database.
-#   role: "tenant_role"
+#   - name: primary
+#     listen: ":5432"
+#     upstream:
+#       host: "db.internal"
+#       port: 5432
+#       sslmode: "require"     # disable | require
+#       user_env: "PG_UPSTREAM_USER"
+#       password_env: "PG_UPSTREAM_PASSWORD"
+#       database: "appdb"
+#     client:
+#       # The single user clients must authenticate as when reaching the proxy.
+#       user: "app_user"
+#       password_env: "PG_PROXY_PASSWORD"
+#     # The Postgres role the proxy SETs at session start. Every query the
+#     # client issues runs as this role on the upstream database.
+#     role: "tenant_role"
+#   - name: analytics
+#     listen: ":5433"
+#     upstream:
+#       host: "analytics.internal"
+#       port: 5432
+#       sslmode: "require"
+#       user_env: "PG_ANALYTICS_USER"
+#       password_env: "PG_ANALYTICS_PASSWORD"
+#       database: "analyticsdb"
+#     client:
+#       user: "analytics_user"
+#       password_env: "PG_ANALYTICS_PROXY_PASSWORD"
+#     role: "analytics_role"
 
 # Optional management API. When `listen` is empty (default), the management
 # server is disabled. When set, the proxy serves an authenticated

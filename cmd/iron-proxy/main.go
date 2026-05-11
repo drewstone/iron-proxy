@@ -200,14 +200,14 @@ func main() {
 		)
 	}
 
-	pgPolicy, err := postgres.LoadFromNode(cfg.Postgres)
+	pgPolicies, err := postgres.LoadFromNode(cfg.Postgres)
 	if err != nil {
 		logger.Error("loading postgres config", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	var pgServer *postgres.Server
-	if pgPolicy != nil {
-		pgServer = postgres.NewServer(pgPolicy, logger)
+	pgServers := make([]*postgres.Server, 0, len(pgPolicies))
+	for _, p := range pgPolicies {
+		pgServers = append(pgServers, postgres.NewServer(p, logger))
 	}
 
 	// Initialize proxy.
@@ -246,8 +246,9 @@ func main() {
 	if mgmtServer != nil {
 		go func() { errc <- fmt.Errorf("management: %w", mgmtServer.ListenAndServe()) }()
 	}
-	if pgServer != nil {
-		go func() { errc <- fmt.Errorf("postgres: %w", pgServer.ListenAndServe()) }()
+	for _, pg := range pgServers {
+		pg := pg
+		go func() { errc <- fmt.Errorf("postgres[%s]: %w", pg.Name(), pg.ListenAndServe()) }()
 	}
 
 	startAttrs := []any{
@@ -300,9 +301,12 @@ func main() {
 			logger.Error("management server shutdown error", slog.String("error", err.Error()))
 		}
 	}
-	if pgServer != nil {
-		if err := pgServer.Shutdown(shutdownCtx); err != nil {
-			logger.Error("postgres server shutdown error", slog.String("error", err.Error()))
+	for _, pg := range pgServers {
+		if err := pg.Shutdown(shutdownCtx); err != nil {
+			logger.Error("postgres server shutdown error",
+				slog.String("name", pg.Name()),
+				slog.String("error", err.Error()),
+			)
 		}
 	}
 

@@ -31,6 +31,10 @@ func NewServer(policy *Policy, logger *slog.Logger) *Server {
 	return &Server{policy: policy, logger: logger}
 }
 
+// Name returns the configured server name. Used in logs and error wrapping
+// when multiple postgres servers are running.
+func (s *Server) Name() string { return s.policy.Name() }
+
 // Addr returns the address the server is bound to. Useful in tests where the
 // configured listen address is ":0" — the actual port is only known after
 // Listen completes. Returns an empty string before ListenAndServe binds.
@@ -55,6 +59,7 @@ func (s *Server) ListenAndServe() error {
 	s.mu.Unlock()
 
 	s.logger.Info("postgres proxy starting",
+		slog.String("name", s.policy.Name()),
 		slog.String("addr", ln.Addr().String()),
 		slog.String("role", s.policy.Role()),
 	)

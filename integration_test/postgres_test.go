@@ -366,3 +366,94 @@ func TestPostgresPolicy(t *testing.T) {
 		}
 	})
 }
+
+// TestPostgresMultipleServers boots one Postgres container and an iron-proxy
+// with two postgres listeners pointing at it — each configured with a
+// different injected role. Verifies they enforce their own roles
+// independently, including RLS scoping.
+func TestPostgresMultipleServers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	initScript, err := filepath.Abs(filepath.Join("testdata", "postgres_init.sql"))
+	require.NoError(t, err)
+
+	container, err := tcpostgres.Run(ctx, pgImage,
+		tcpostgres.WithDatabase(pgUpstreamDB),
+		tcpostgres.WithUsername(pgUpstreamUser),
+		tcpostgres.WithPassword(pgUpstreamPass),
+		tcpostgres.WithInitScripts(initScript),
+		tcpostgres.BasicWaitStrategies(),
+	)
+	if err != nil {
+		t.Skipf("postgres testcontainers unavailable (is Docker running?): %v", err)
+	}
+	testcontainers.CleanupContainer(t, container)
+
+	upstreamHost, err := container.Host(ctx)
+	require.NoError(t, err)
+	upstreamPort, err := container.MappedPort(ctx, "5432/tcp")
+	require.NoError(t, err)
+
+	cfgPath := renderConfig(t, t.TempDir(), "postgres_multi_pipeline.yaml", map[string]string{
+		"UpstreamHost": upstreamHost,
+		"UpstreamPort": strconv.Itoa(int(upstreamPort.Num())),
+	})
+
+	env := []string{
+		"PG_UPSTREAM_USER=" + pgUpstreamUser,
+		"PG_UPSTREAM_PASSWORD=" + pgUpstreamPass,
+		"PG_PROXY_PASSWORD=" + pgClientPassword,
+	}
+	proxy := startProxy(t, proxyBinary(t), cfgPath, env)
+
+	primaryAddr := proxy.AddrForNamed(t, "postgres proxy starting", "primary")
+	secondaryAddr := proxy.AddrForNamed(t, "postgres proxy starting", "secondary")
+	require.NotEqual(t, primaryAddr, secondaryAddr, "each named server must bind a distinct port")
+
+	connStrTo := func(addr string) string {
+		host, port, _ := net.SplitHostPort(addr)
+		return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
+			pgClientUser, pgClientPassword, host, port, pgUpstreamDB)
+	}
+
+	queryRole := func(t *testing.T, addr string) string {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, err := pgconn.Connect(ctx, connStrTo(addr))
+		require.NoError(t, err)
+		defer conn.Close(context.Background())
+		results, err := conn.Exec(ctx, "SELECT current_role").ReadAll()
+		require.NoError(t, err)
+		require.Len(t, results, 1)
+		require.Len(t, results[0].Rows, 1)
+		return string(results[0].Rows[0][0])
+	}
+
+	t.Run("each listener enforces its own role", func(t *testing.T) {
+		require.Equal(t, "tenant_role", queryRole(t, primaryAddr))
+		require.Equal(t, "other_role", queryRole(t, secondaryAddr))
+	})
+
+	t.Run("rls scopes rows differently per listener", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		// Through the primary listener: tenant_role sees only tenant_role's rows.
+		primary, err := pgx.Connect(ctx, connStrTo(primaryAddr))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = primary.Close(ctx) })
+		var primaryCount int
+		require.NoError(t, primary.QueryRow(ctx, "SELECT count(*) FROM items").Scan(&primaryCount))
+		require.Equal(t, 2, primaryCount, "primary listener should see only tenant_role's rows")
+
+		// Through the secondary listener: other_role sees only other_role's rows.
+		secondary, err := pgx.Connect(ctx, connStrTo(secondaryAddr))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = secondary.Close(ctx) })
+		var secondaryCount int
+		require.NoError(t, secondary.QueryRow(ctx, "SELECT count(*) FROM items").Scan(&secondaryCount))
+		require.Equal(t, 3, secondaryCount, "secondary listener should see only other_role's rows")
+	})
+}
