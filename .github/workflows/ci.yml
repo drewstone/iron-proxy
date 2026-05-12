@@ -34,6 +34,7 @@ jobs:
       - uses: ironsh/iron-proxy-action@fa1fd82ec32396d044deba7040a6db576bec927a # v0.1.4
         with:
           egress-rules: egress-rules.yaml
+          disable-docker: false
 
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
@@ -45,6 +46,34 @@ jobs:
       - name: Generate test CA
         run: ./iron-proxy generate-ca -outdir tmp -alg ed25519
 
+      - name: Start 1Password Connect server
+        working-directory: integration_test/op_connect
+        env:
+          OP_CONNECT_CREDENTIALS_JSON: ${{ secrets.OP_CONNECT_CREDENTIALS_JSON }}
+          OP_CONNECT_TOKEN: ${{ secrets.OP_CONNECT_TOKEN }}
+        run: |
+          printf '%s' "$OP_CONNECT_CREDENTIALS_JSON" > 1password-credentials.json
+          docker compose up -d
+          # Wait for connect-sync to populate the shared data volume so the
+          # API can actually serve vault contents. /heartbeat returns 200 as
+          # soon as the API process is listening, so we probe /v1/vaults
+          # (auth required) instead.
+          for i in $(seq 1 30); do
+            code=$(curl -s --max-time 2 -o /tmp/vaults.out -w '%{http_code}' \
+              -H "Authorization: Bearer $OP_CONNECT_TOKEN" \
+              http://localhost:8080/v1/vaults || true)
+            echo "attempt $i: /v1/vaults -> $code"
+            if [ "$code" = "200" ]; then
+              echo "Connect server is ready (vault sync complete)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Connect server failed to become ready (last status: $code)" >&2
+          cat /tmp/vaults.out >&2 || true
+          docker compose logs
+          exit 1
+
       - name: Run integration tests
         run: go test -v -race -count=1 ./integration_test/ -integration
         env:
@@ -54,6 +83,20 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          OP_CONNECT_HOST: http://localhost:8080
+          OP_CONNECT_TOKEN: ${{ secrets.OP_CONNECT_TOKEN }}
+
+      - name: Dump 1Password Connect logs
+        if: failure()
+        working-directory: integration_test/op_connect
+        run: docker compose logs || true
+
+      - name: Stop 1Password Connect server
+        if: always()
+        working-directory: integration_test/op_connect
+        run: |
+          docker compose down -v || true
+          rm -f 1password-credentials.json
 
       - uses: ironsh/iron-proxy-action/summary@fa1fd82ec32396d044deba7040a6db576bec927a # v0.1.4
         if: always()

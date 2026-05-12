@@ -130,10 +130,11 @@ func factory(cfg yaml.Node, logger *slog.Logger) (transform.Transformer, error) 
 		return nil, fmt.Errorf("parsing secrets config: %w", err)
 	}
 	registry := sourceBuilderRegistry{
-		"env":       newEnvBuilder(logger),
-		"aws_sm":    newAWSSMBuilder(logger),
-		"aws_ssm":   newAWSSSMBuilder(logger),
-		"1password": newOPBuilder(logger),
+		"env":               newEnvBuilder(logger),
+		"aws_sm":            newAWSSMBuilder(logger),
+		"aws_ssm":           newAWSSSMBuilder(logger),
+		"1password":         newOPBuilder(logger),
+		"1password_connect": newOPConnectBuilder(logger),
 	}
 	return newFromConfig(c, registry)
 }
