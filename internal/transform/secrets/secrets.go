@@ -129,14 +129,44 @@ func factory(cfg yaml.Node, logger *slog.Logger) (transform.Transformer, error) 
 	if err := cfg.Decode(&c); err != nil {
 		return nil, fmt.Errorf("parsing secrets config: %w", err)
 	}
-	registry := sourceBuilderRegistry{
+	return newFromConfig(c, defaultRegistry(logger))
+}
+
+// defaultRegistry returns the standard set of secret source builders. It is
+// used by both the secrets transform's factory and by BuildSource so other
+// transforms can compose the same sources.
+func defaultRegistry(logger *slog.Logger) sourceBuilderRegistry {
+	return sourceBuilderRegistry{
 		"env":               newEnvBuilder(logger),
 		"aws_sm":            newAWSSMBuilder(logger),
 		"aws_ssm":           newAWSSSMBuilder(logger),
 		"1password":         newOPBuilder(logger),
 		"1password_connect": newOPConnectBuilder(logger),
 	}
-	return newFromConfig(c, registry)
+}
+
+// BuildSource constructs a secret Source from a yaml node shaped like a
+// top-level "source:" block (e.g. {type: env, var: FOO}). It is intended for
+// other transforms that want to load their inputs from any registered
+// secrets backend (1Password, AWS SM, etc.).
+func BuildSource(node yaml.Node, logger *slog.Logger) (Source, error) {
+	return resolveSource(defaultRegistry(logger), node)
+}
+
+// resolveSource dispatches a source config through the registry.
+func resolveSource(registry sourceBuilderRegistry, node yaml.Node) (secretSource, error) {
+	var hint sourceTypeHint
+	if err := node.Decode(&hint); err != nil {
+		return nil, fmt.Errorf("parsing source type: %w", err)
+	}
+	if hint.Type == "" {
+		return nil, fmt.Errorf("source.type is required")
+	}
+	builder, ok := registry[hint.Type]
+	if !ok {
+		return nil, fmt.Errorf("unsupported source type %q", hint.Type)
+	}
+	return builder.Build(node)
 }
 
 // newFromConfig creates a Secrets transform from a parsed config.

@@ -41,3 +41,6 @@ domains:
 
   # 1Password (for 1password secret source integration tests)
   - "ironsh.1password.com"
+
+  # GCP (for gcp_auth integration tests: oauth2 token exchange + BigQuery API)
+  - "*.googleapis.com"

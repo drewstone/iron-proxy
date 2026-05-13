@@ -16,12 +16,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// secretSource is a prepared secret. Get fetches the current value, possibly
+// Source is a prepared secret. Get fetches the current value, possibly
 // from a cache; Name returns a stable display name for logging.
-type secretSource interface {
+type Source interface {
 	Name() string
 	Get(ctx context.Context) (string, error)
 }
+
+// secretSource is the package-internal alias for Source. Kept so existing
+// internal call sites stay terse.
+type secretSource = Source
 
 // secretSourceBuilder validates source config and returns a secretSource that
 // fetches lazily on first Get. Build must not perform I/O — only static
