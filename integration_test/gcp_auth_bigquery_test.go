@@ -108,7 +108,5 @@ func TestGCPAuthBigQuery(t *testing.T) {
 	require.True(t, qr.JobComplete, "BigQuery job not complete in synchronous response: %s", string(body))
 	require.NotEmpty(t, qr.Rows, "no rows returned from test_dataset.test_table")
 	require.NotEmpty(t, qr.Rows[0].F, "first row has no fields")
-	require.NotNil(t, qr.Rows[0].F[0].V, "first cell of first row is nil")
-
-	t.Logf("test_dataset.test_table.test_field first value: %v", qr.Rows[0].F[0].V)
+	require.Equal(t, "foo", qr.Rows[0].F[0].V, "test_dataset.test_table.test_field first value")
 }
