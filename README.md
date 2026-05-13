@@ -405,6 +405,11 @@ Secret sources:
   default; override with `host_env` and `token_env`. Optional `ttl` and
   `failure_ttl` are supported.
 
+Path segments may be written literally or percent-encoded, so vault/item names
+containing spaces, `&`, `/`, or other special characters work either as
+`op://AI Keys & Passwords/OpenAI/credential` or
+`op://AI%20Keys%20%26%20Passwords/OpenAI/credential`.
+
 `ttl` controls how long a successfully fetched value is cached before refresh
 (empty caches forever). `failure_ttl` controls how long a fetch error is
 cached before retrying; it defaults to 1m and is independent of `ttl`, so a

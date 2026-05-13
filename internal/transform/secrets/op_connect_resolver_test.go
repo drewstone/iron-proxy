@@ -141,6 +141,52 @@ func TestOPConnectBuilder_PassesParsedRefToClient(t *testing.T) {
 	require.Equal(t, "vault-uuid", gotItemVaultRef)
 }
 
+// TestOPConnectBuilder_DecodesSpecialCharsInRef verifies that percent-encoded
+// segments in the secret_ref are decoded before being passed to the Connect
+// SDK (which handles URL encoding for the API call internally).
+func TestOPConnectBuilder_DecodesSpecialCharsInRef(t *testing.T) {
+	tests := []struct {
+		name      string
+		secretRef string
+		wantVault string
+	}{
+		{
+			name:      "literal special chars passed through",
+			secretRef: "op://AI Keys & Passwords/OpenAI/credential",
+			wantVault: "AI Keys & Passwords",
+		},
+		{
+			name:      "percent-encoded segments are decoded",
+			secretRef: "op://AI%20Keys%20%26%20Passwords/OpenAI/credential",
+			wantVault: "AI Keys & Passwords",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotVaultRef string
+			client := &mockOPConnectClient{
+				getVault: func(ref string) (*onepassword.Vault, error) {
+					gotVaultRef = ref
+					return sampleVault(), nil
+				},
+				getItem: func(string, string) (*onepassword.Item, error) {
+					return sampleItem(), nil
+				},
+			}
+			r := newTestOPConnectBuilder(client)
+			node := yamlNode(t, map[string]string{
+				"type":       "1password_connect",
+				"secret_ref": tt.secretRef,
+			})
+			result, err := r.Build(node)
+			require.NoError(t, err)
+			_, err = result.Get(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, tt.wantVault, gotVaultRef)
+		})
+	}
+}
+
 func TestOPConnectBuilder_SectionRef(t *testing.T) {
 	r := newTestOPConnectBuilder(staticOPConnectClient(sampleVault(), sampleItem()))
 	node := yamlNode(t, map[string]string{
@@ -324,6 +370,26 @@ func TestParseOPRef(t *testing.T) {
 			input:   "op://a//c",
 			wantErr: "empty path segment",
 		},
+		{
+			name:  "percent-encoded vault name",
+			input: "op://AI%20Keys%20%26%20Passwords/OpenAI/credential",
+			want:  opRef{vault: "AI Keys & Passwords", item: "OpenAI", field: "credential"},
+		},
+		{
+			name:  "literal special chars",
+			input: "op://AI Keys & Passwords/OpenAI/credential",
+			want:  opRef{vault: "AI Keys & Passwords", item: "OpenAI", field: "credential"},
+		},
+		{
+			name:  "encoded slash in vault name",
+			input: "op://AI%2FKeys/item/field",
+			want:  opRef{vault: "AI/Keys", item: "item", field: "field"},
+		},
+		{
+			name:    "invalid percent-encoding",
+			input:   "op://bad%ZZ/item/field",
+			wantErr: "invalid percent-encoding",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -335,6 +401,40 @@ func TestParseOPRef(t *testing.T) {
 			}
 			require.NoError(t, err)
 			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestOPRefEncoded(t *testing.T) {
+	tests := []struct {
+		name string
+		in   opRef
+		want string
+	}{
+		{
+			name: "alphanumeric segments unchanged",
+			in:   opRef{vault: "Engineering", item: "OpenAI", field: "credential"},
+			want: "op://Engineering/OpenAI/credential",
+		},
+		{
+			name: "spaces and ampersand escaped",
+			in:   opRef{vault: "AI Keys & Passwords", item: "OpenAI", field: "credential"},
+			want: "op://AI%20Keys%20%26%20Passwords/OpenAI/credential",
+		},
+		{
+			name: "slash in segment is escaped",
+			in:   opRef{vault: "AI/Keys", item: "item", field: "field"},
+			want: "op://AI%2FKeys/item/field",
+		},
+		{
+			name: "section included",
+			in:   opRef{vault: "v", item: "i", section: "my section", field: "key"},
+			want: "op://v/i/my%20section/key",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, tt.in.encoded())
 		})
 	}
 }

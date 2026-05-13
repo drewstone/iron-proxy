@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strings"
 	"sync"
 
 	onepassword "github.com/1password/onepassword-sdk-go"
@@ -63,23 +62,25 @@ func (r *opBuilder) Build(raw yaml.Node) (secretSource, error) {
 	if cfg.SecretRef == "" {
 		return nil, fmt.Errorf("1password source requires \"secret_ref\" field")
 	}
-	if !strings.HasPrefix(cfg.SecretRef, "op://") {
-		return nil, fmt.Errorf("1password secret_ref %q must start with \"op://\"", cfg.SecretRef)
+	ref, err := parseOPRef(cfg.SecretRef)
+	if err != nil {
+		return nil, fmt.Errorf("1password: %w", err)
 	}
 	if cfg.TokenEnv == "" {
 		cfg.TokenEnv = defaultOPTokenEnv
 	}
+	encoded := ref.encoded()
 	return buildLazySource(cfg.SecretRef, cfg.TTL, cfg.FailureTTL, r.logger, func(ctx context.Context) (string, error) {
-		return r.fetchSecret(ctx, cfg)
+		return r.fetchSecret(ctx, cfg, encoded)
 	})
 }
 
-func (r *opBuilder) fetchSecret(ctx context.Context, cfg opConfig) (string, error) {
+func (r *opBuilder) fetchSecret(ctx context.Context, cfg opConfig, ref string) (string, error) {
 	client, err := r.clientFor(ctx, cfg.TokenEnv)
 	if err != nil {
 		return "", fmt.Errorf("creating 1password client: %w", err)
 	}
-	val, err := client.Resolve(ctx, cfg.SecretRef)
+	val, err := client.Resolve(ctx, ref)
 	if err != nil {
 		return "", fmt.Errorf("resolving 1password secret %q: %w", cfg.SecretRef, err)
 	}

@@ -115,6 +115,53 @@ func TestOPBuilder_PassesSecretRefToClient(t *testing.T) {
 	require.Equal(t, "op://vault/item/section/field", gotRef)
 }
 
+// TestOPBuilder_EncodesSpecialCharsForSDK verifies that vault, item, section,
+// and field names containing characters that would confuse the 1Password
+// reference parser (spaces, "&", etc.) are percent-encoded before being
+// passed to the SDK, regardless of whether the user wrote them literally or
+// already encoded.
+func TestOPBuilder_EncodesSpecialCharsForSDK(t *testing.T) {
+	tests := []struct {
+		name      string
+		secretRef string
+		wantRef   string
+		wantName  string
+	}{
+		{
+			name:      "literal special chars are encoded",
+			secretRef: "op://AI Keys & Passwords/OpenAI/credential",
+			wantRef:   "op://AI%20Keys%20%26%20Passwords/OpenAI/credential",
+			wantName:  "op://AI Keys & Passwords/OpenAI/credential",
+		},
+		{
+			name:      "already-encoded ref is normalized",
+			secretRef: "op://AI%20Keys%20%26%20Passwords/OpenAI/credential",
+			wantRef:   "op://AI%20Keys%20%26%20Passwords/OpenAI/credential",
+			wantName:  "op://AI%20Keys%20%26%20Passwords/OpenAI/credential",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotRef string
+			client := &mockOPClient{fn: func(_ context.Context, ref string) (string, error) {
+				gotRef = ref
+				return "v", nil
+			}}
+			r := newTestOPBuilder(client)
+			node := yamlNode(t, map[string]string{
+				"type":       "1password",
+				"secret_ref": tt.secretRef,
+			})
+			result, err := r.Build(node)
+			require.NoError(t, err)
+			require.Equal(t, tt.wantName, result.Name())
+			_, err = result.Get(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, tt.wantRef, gotRef)
+		})
+	}
+}
+
 func TestOPBuilder_Errors(t *testing.T) {
 	tests := []struct {
 		name   string
