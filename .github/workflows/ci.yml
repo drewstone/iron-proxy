@@ -74,28 +74,13 @@ jobs:
           docker compose logs
           exit 1
 
-      # The BigQuery service account key is stored base64-encoded in
-      # secrets so GitHub Actions' substring-based secret redaction doesn't
-      # mangle unrelated job output that happens to share fragments with the
-      # JSON keyfile (project id, common phrases, etc.). Decode it here and
-      # expose the JSON to the test step as a normal env var.
-      - name: Decode BigQuery service account key
-        env:
-          BQ_SA_KEY_ENCODED: ${{ secrets.GCP_BIGQUERY_SERVICE_ACCOUNT_KEY }}
-        run: |
-          if [ -z "$BQ_SA_KEY_ENCODED" ]; then
-            echo "GCP_BIGQUERY_SERVICE_ACCOUNT_KEY not set; BigQuery test will skip"
-            exit 0
-          fi
-          {
-            echo "GCP_BIGQUERY_SERVICE_ACCOUNT_KEY<<__IRON_EOF__"
-            printf '%s' "$BQ_SA_KEY_ENCODED" | base64 -d
-            echo
-            echo "__IRON_EOF__"
-          } >> "$GITHUB_ENV"
-
       - name: Run integration tests
-        run: go test -v -race -count=1 ./integration_test/ -integration
+        # The BigQuery service account key is stored base64-encoded in
+        # secrets so GitHub Actions' substring-based redaction can't mangle
+        # unrelated job output that happens to share fragments with the JSON
+        # keyfile. We decode it inline to a temp file and export only the
+        # path — the decoded JSON never appears in the env block GitHub
+        # prints at step start.
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -105,6 +90,15 @@ jobs:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
           OP_CONNECT_HOST: http://localhost:8080
           OP_CONNECT_TOKEN: ${{ secrets.OP_CONNECT_TOKEN }}
+          GCP_BIGQUERY_SERVICE_ACCOUNT_KEY_B64: ${{ secrets.GCP_BIGQUERY_SERVICE_ACCOUNT_KEY }}
+        run: |
+          if [ -n "$GCP_BIGQUERY_SERVICE_ACCOUNT_KEY_B64" ]; then
+            keyfile="$RUNNER_TEMP/gcp-bq-sa-key.json"
+            printf '%s' "$GCP_BIGQUERY_SERVICE_ACCOUNT_KEY_B64" | base64 -d > "$keyfile"
+            chmod 600 "$keyfile"
+            export GCP_BIGQUERY_SERVICE_ACCOUNT_KEY_FILE="$keyfile"
+          fi
+          go test -v -race -count=1 ./integration_test/ -integration
 
       - name: Dump 1Password Connect logs
         if: failure()

@@ -21,9 +21,7 @@ transforms:
 
   - name: gcp_auth
     config:
-      keyfile:
-        type: env
-        var: GCP_BIGQUERY_SERVICE_ACCOUNT_KEY
+      keyfile_path: "{{ .KeyfilePath }}"
       scopes:
         - "https://www.googleapis.com/auth/bigquery"
       rules:

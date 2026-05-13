@@ -18,33 +18,39 @@ import (
 )
 
 // TestGCPAuthBigQuery boots the proxy with the gcp_auth transform configured
-// to mint OAuth2 access tokens from the service account JSON in
-// GCP_BIGQUERY_SERVICE_ACCOUNT_KEY, then runs a BigQuery query through the
-// proxy and asserts the first cell of the first row is returned. The client
-// sends no Authorization header — the proxy injects one after minting a token
-// from the keyfile.
+// to mint OAuth2 access tokens from the service account JSON keyfile at
+// GCP_BIGQUERY_SERVICE_ACCOUNT_KEY_FILE, then runs a BigQuery query through
+// the proxy and asserts the first cell of the first row is returned. The
+// client sends no Authorization header — the proxy injects one after minting
+// a token from the keyfile.
+//
+// The keyfile is passed as a file path rather than an env var so the decoded
+// JSON doesn't leak into GitHub Actions' env block, which is printed at the
+// start of every step.
 //
 // Requires a BigQuery table at test_dataset.test_table with a test_field
 // column readable by the configured service account.
 func TestGCPAuthBigQuery(t *testing.T) {
-	keyJSON := os.Getenv("GCP_BIGQUERY_SERVICE_ACCOUNT_KEY")
-	if keyJSON == "" {
-		t.Skip("GCP_BIGQUERY_SERVICE_ACCOUNT_KEY not set")
+	keyfilePath := os.Getenv("GCP_BIGQUERY_SERVICE_ACCOUNT_KEY_FILE")
+	if keyfilePath == "" {
+		t.Skip("GCP_BIGQUERY_SERVICE_ACCOUNT_KEY_FILE not set")
 	}
+	keyJSON, err := os.ReadFile(keyfilePath)
+	require.NoError(t, err, "reading GCP_BIGQUERY_SERVICE_ACCOUNT_KEY_FILE")
 
 	var meta struct {
 		ProjectID string `json:"project_id"`
 	}
-	require.NoError(t, json.Unmarshal([]byte(keyJSON), &meta))
+	require.NoError(t, json.Unmarshal(keyJSON, &meta))
 	require.NotEmpty(t, meta.ProjectID, "service account JSON missing project_id")
 
 	tmpDir := t.TempDir()
 	binary := proxyBinary(t)
-	cfgPath := renderConfig(t, tmpDir, "gcp_auth_bigquery.yaml", nil)
+	cfgPath := renderConfig(t, tmpDir, "gcp_auth_bigquery.yaml", struct {
+		KeyfilePath string
+	}{KeyfilePath: keyfilePath})
 
-	proxy := startProxy(t, binary, cfgPath, []string{
-		"GCP_BIGQUERY_SERVICE_ACCOUNT_KEY=" + keyJSON,
-	})
+	proxy := startProxy(t, binary, cfgPath, nil)
 
 	// Trust the proxy's CA so the client accepts the MITM cert it presents
 	// for bigquery.googleapis.com.
