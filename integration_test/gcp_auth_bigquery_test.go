@@ -54,7 +54,10 @@ func TestGCPAuthBigQuery(t *testing.T) {
 	pool := x509.NewCertPool()
 	require.True(t, pool.AppendCertsFromPEM(caPEM))
 
-	proxyURL, err := url.Parse("http://" + proxy.HTTPAddr)
+	// CONNECT requests for HTTPS upstreams go to the tunnel listener, not the
+	// HTTP proxy listener.
+	tunnelAddr := proxy.AddrFor(t, "tunnel proxy starting")
+	proxyURL, err := url.Parse("http://" + tunnelAddr)
 	require.NoError(t, err)
 
 	client := &http.Client{
