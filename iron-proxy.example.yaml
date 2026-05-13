@@ -226,6 +226,37 @@ transforms:
         #   rules:
         #     - host: "api.openai.com"
 
+  # GCP service account authentication. Signs a JWT with the configured
+  # keyfile, exchanges it at Google's token endpoint for a short-lived OAuth2
+  # access token, and sets Authorization: Bearer on matching requests. Tokens
+  # are cached and refreshed automatically before expiry. Scopes are baked
+  # into the minted token; widen them if one configured transform serves
+  # multiple GCP APIs. Requires MITM mode (sni-only mode cannot rewrite
+  # headers). On token-minting failure the request is rejected (403); set
+  # fallback: skip to pass through unauthenticated instead.
+  #
+  # The keyfile JSON can come from disk via keyfile_path, or from any other
+  # configured secret source (env, aws_sm, aws_ssm, 1password,
+  # 1password_connect) via a nested keyfile block. Use exactly one.
+  # - name: gcp_auth
+  #   config:
+  #     keyfile_path: "/etc/iron-proxy/gcp-sa.json"
+  #     scopes:
+  #       - "https://www.googleapis.com/auth/cloud-platform"
+  #     rules:
+  #       - host: "*.googleapis.com"
+  #
+  # Same thing, keyfile sourced from 1Password Connect:
+  # - name: gcp_auth
+  #   config:
+  #     keyfile:
+  #       type: 1password_connect
+  #       secret_ref: "op://Engineering/GCP-SA/credential"
+  #     scopes:
+  #       - "https://www.googleapis.com/auth/cloud-platform"
+  #     rules:
+  #       - host: "*.googleapis.com"
+
   # Header allowlist: strips any request header not listed below before the
   # request goes upstream. Default-deny — every header must either match a
   # literal name (case-insensitive) or a /regex/ pattern. Place this AFTER
