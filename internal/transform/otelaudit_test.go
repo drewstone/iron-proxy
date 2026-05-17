@@ -236,9 +236,9 @@ func TestOTELAuditFunc_BodyCapture_PopulatesGroup(t *testing.T) {
 	require.Contains(t, attrs, "body_capture")
 	bc := mapFromValue(attrs["body_capture"])
 	require.Contains(t, bc, "request_body")
-	assert.Equal(t, `{"prompt":"hi"}`, bc["request_body"].AsString())
+	require.Equal(t, `{"prompt":"hi"}`, bc["request_body"].AsString())
 	require.Contains(t, bc, "request_body_truncated")
-	assert.Equal(t, false, bc["request_body_truncated"].AsBool())
+	require.Equal(t, false, bc["request_body_truncated"].AsBool())
 }
 
 func TestOTELAuditFunc_BodyCapture_TruncationFlagPropagates(t *testing.T) {
@@ -264,7 +264,7 @@ func TestOTELAuditFunc_BodyCapture_TruncationFlagPropagates(t *testing.T) {
 	require.Contains(t, attrs, "body_capture")
 	bc := mapFromValue(attrs["body_capture"])
 	require.Contains(t, bc, "request_body_truncated")
-	assert.True(t, bc["request_body_truncated"].AsBool())
+	require.True(t, bc["request_body_truncated"].AsBool())
 }
 
 func TestOTELAuditFunc_BodyCapture_NilOmitsGroup(t *testing.T) {
@@ -287,7 +287,7 @@ func TestOTELAuditFunc_BodyCapture_NilOmitsGroup(t *testing.T) {
 	require.Len(t, records, 1)
 
 	attrs := recordAttrs(records[0])
-	assert.NotContains(t, attrs, "body_capture")
+	require.NotContains(t, attrs, "body_capture")
 }
 
 func TestChainAuditFuncs(t *testing.T) {
