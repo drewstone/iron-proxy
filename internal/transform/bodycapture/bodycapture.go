@@ -1,7 +1,7 @@
 // Package bodycapture implements a transform that captures request bodies of
 // matching requests and exposes them via PipelineResult.BodyCapture for the
-// audit emitters to render as top-level `request_body` and
-// `request_body_truncated` audit fields.
+// audit emitters to render as a `body_capture` group holding `request_body`
+// and `request_body_truncated`.
 //
 // This transform captures request bodies only. It does not capture response
 // bodies: BufferedBody buffers then replays rather than streaming, so reading
@@ -69,7 +69,8 @@ func (b *bodyCapture) Name() string { return "body_capture" }
 // if the request matches a configured rule, attaches the captured (and
 // possibly truncated) body bytes to TransformContext.BodyCapture. The proxy
 // copies that onto PipelineResult after the pipeline returns; the audit
-// emitters render it as top-level `request_body` + `request_body_truncated`.
+// emitters render it as a `body_capture` group with `request_body` +
+// `request_body_truncated`.
 //
 // Always returns ActionContinue — body_capture is observation-only and never
 // rejects a request. Read errors are annotated for observability and swallowed

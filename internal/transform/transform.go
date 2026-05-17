@@ -84,8 +84,8 @@ type TransformContext struct {
 	// BodyCapture is the side channel a body_capture transform uses to
 	// communicate captured request body bytes out of the pipeline. The proxy
 	// copies it onto PipelineResult after the request pipeline runs so the
-	// audit emitters can render top-level `request_body` / `request_body_truncated`
-	// fields. nil when no body_capture rule matched.
+	// audit emitters can render a `body_capture` group with `request_body` /
+	// `request_body_truncated`. nil when no body_capture rule matched.
 	BodyCapture BodyCapture
 
 	// annotations is written by transforms via Annotate and read by the pipeline
@@ -152,8 +152,8 @@ type PipelineResult struct {
 	// BodyCapture carries captured request body bytes from a body_capture
 	// transform when the request matched a configured rule. nil otherwise.
 	// Populated by the proxy by copying tctx.BodyCapture after the request
-	// pipeline runs; rendered by the audit functions as top-level
-	// `request_body` and `request_body_truncated` fields. The transform
+	// pipeline runs; rendered by the audit functions as a `body_capture`
+	// group with `request_body` and `request_body_truncated`. The transform
 	// package treats the concrete type as opaque to avoid an import cycle
 	// with internal/transform/bodycapture.
 	BodyCapture BodyCapture

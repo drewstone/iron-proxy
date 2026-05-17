@@ -362,10 +362,10 @@ transforms:
 ### Body capture
 
 Records the decoded request body of matching requests and surfaces it on the
-audit log record as top-level `request_body` and `request_body_truncated`
-fields. Useful for auditing the payloads passing through the proxy, such as the
-prompts a sandbox sends to an LLM provider, without modifying the upstream
-traffic.
+audit log record in a `body_capture` group holding `request_body` and
+`request_body_truncated`. Useful for auditing the payloads passing through the
+proxy, such as the prompts a sandbox sends to an LLM provider, without
+modifying the upstream traffic.
 
 Hosts, methods, and paths are matched with the same `rules` syntax as
 `allowlist` and `secrets`. `max_request_body_bytes` caps how much of each body
