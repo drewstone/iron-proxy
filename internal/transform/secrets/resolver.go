@@ -164,7 +164,6 @@ type awsSMConfig struct {
 	Type       string `yaml:"type"`
 	SecretID   string `yaml:"secret_id"`
 	Region     string `yaml:"region,omitempty"`
-	JSONKey    string `yaml:"json_key,omitempty"`
 	TTL        string `yaml:"ttl,omitempty"`
 	FailureTTL string `yaml:"failure_ttl,omitempty"`
 }
@@ -202,12 +201,6 @@ func (r *awsSMBuilder) fetchSecret(ctx context.Context, cfg awsSMConfig) (string
 		return "", fmt.Errorf("fetching secret %q: %w", cfg.SecretID, err)
 	}
 	val := aws.ToString(out.SecretString)
-	if cfg.JSONKey != "" {
-		val, err = extractJSONKey(val, cfg.JSONKey)
-		if err != nil {
-			return "", fmt.Errorf("extracting json_key %q from secret %q: %w", cfg.JSONKey, cfg.SecretID, err)
-		}
-	}
 	if val == "" {
 		return "", fmt.Errorf("secret %q resolved to empty value", cfg.SecretID)
 	}
@@ -232,7 +225,6 @@ type awsSSMConfig struct {
 	Name           string `yaml:"name"`
 	Region         string `yaml:"region,omitempty"`
 	WithDecryption *bool  `yaml:"with_decryption,omitempty"`
-	JSONKey        string `yaml:"json_key,omitempty"`
 	TTL            string `yaml:"ttl,omitempty"`
 	FailureTTL     string `yaml:"failure_ttl,omitempty"`
 }
@@ -278,12 +270,6 @@ func (r *awsSSMBuilder) fetchParameter(ctx context.Context, cfg awsSSMConfig) (s
 		return "", fmt.Errorf("parameter %q resolved without a value", cfg.Name)
 	}
 	val := aws.ToString(out.Parameter.Value)
-	if cfg.JSONKey != "" {
-		val, err = extractJSONKey(val, cfg.JSONKey)
-		if err != nil {
-			return "", fmt.Errorf("extracting json_key %q from parameter %q: %w", cfg.JSONKey, cfg.Name, err)
-		}
-	}
 	if val == "" {
 		return "", fmt.Errorf("parameter %q resolved to empty value", cfg.Name)
 	}
@@ -363,6 +349,29 @@ func (cv *cachedValue) Get(ctx context.Context) (string, error) {
 }
 
 // --- JSON extraction ---
+
+// jsonKeySource wraps a source whose value is a JSON object, exposing the
+// single top-level string field named by key. Extraction runs on every Get;
+// the wrapped source's own caching keeps that cheap. Available to every source
+// type via the optional json_key field (see resolveSource).
+type jsonKeySource struct {
+	inner secretSource
+	key   string
+}
+
+func (s *jsonKeySource) Name() string { return s.inner.Name() }
+
+func (s *jsonKeySource) Get(ctx context.Context) (string, error) {
+	raw, err := s.inner.Get(ctx)
+	if err != nil {
+		return "", err
+	}
+	val, err := extractJSONKey(raw, s.key)
+	if err != nil {
+		return "", fmt.Errorf("extracting json_key %q from secret %q: %w", s.key, s.inner.Name(), err)
+	}
+	return val, nil
+}
 
 // extractJSONKey parses raw as JSON and returns the string value at key.
 func extractJSONKey(raw, key string) (string, error) {

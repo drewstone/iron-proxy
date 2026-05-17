@@ -237,6 +237,9 @@ transforms:
   # The keyfile JSON can come from disk via keyfile_path, or from any other
   # configured secret source (env, aws_sm, aws_ssm, 1password,
   # 1password_connect) via a nested keyfile block. Use exactly one.
+  #
+  # Set subject to impersonate a Workspace user via domain-wide delegation:
+  # the minted token then acts as that user rather than the service account.
   # - name: gcp_auth
   #   config:
   #     keyfile_path: "/etc/iron-proxy/gcp-sa.json"
@@ -245,12 +248,13 @@ transforms:
   #     rules:
   #       - host: "*.googleapis.com"
   #
-  # Same thing, keyfile sourced from 1Password Connect:
+  # Same thing, keyfile sourced from 1Password Connect, impersonating a user:
   # - name: gcp_auth
   #   config:
   #     keyfile:
   #       type: 1password_connect
   #       secret_ref: "op://Engineering/GCP-SA/credential"
+  #     subject: "user@workspace.example.com"   # optional, domain-wide delegation
   #     scopes:
   #       - "https://www.googleapis.com/auth/cloud-platform"
   #     rules:
@@ -258,41 +262,57 @@ transforms:
 
   # OAuth2 token injection. Mints short-lived OAuth2 access tokens and sets
   # Authorization: Bearer on matching requests. Each entry under tokens names
-  # a grant type, a credential, and the hosts it applies to. Token exchange,
-  # caching, and refresh are handled automatically. Requires MITM mode. On a
-  # minting failure the request is rejected with a 502.
+  # a grant type, its credential fields, and the hosts it applies to. Token
+  # exchange, caching, and refresh are handled automatically. Requires MITM
+  # mode. On a minting failure the request is rejected with a 502.
   #
   # grant is one of:
-  #   refresh_token       RFC 6749 — an authorized-user blob (a refresh token)
-  #   jwt_bearer          RFC 7523 — a GCP service-account keyfile
+  #   refresh_token       RFC 6749 — a refresh token plus a client id
   #   client_credentials  RFC 6749 4.4 — a client id and secret
   #
-  # credential resolves the credential blob from any secret source (env,
-  # aws_sm, aws_ssm, 1password, 1password_connect), the same shape as a
-  # secrets transform source. Setting token_endpoint also stubs that endpoint,
-  # so a sandboxed client SDK can complete its own token dance against the
-  # proxy with a placeholder token while the proxy injects the real one.
+  # (For GCP service-account auth — the RFC 7523 JWT-bearer grant — use the
+  # gcp_auth transform above instead.)
+  #
+  # Each credential field is a discrete secret source, the same shape as a
+  # secrets transform source (env, aws_sm, aws_ssm, 1password,
+  # 1password_connect); add json_key to any source to pull one field out of a
+  # JSON secret. token_endpoint is required.
+  #
+  # Setting token_endpoint also stubs that endpoint, so a sandboxed client SDK
+  # can complete its own token dance against the proxy with a placeholder
+  # token while the proxy injects the real one.
   # - name: oauth_token
   #   config:
   #     tokens:
+  #       # Each field resolved from its own source.
   #       - grant: refresh_token
-  #         credential:
+  #         refresh_token:
   #           type: 1password_connect
-  #           secret_ref: "op://Engineering/GSUITE-OAUTH/credential"
+  #           secret_ref: "op://Engineering/GSUITE-OAUTH/refresh-token"
+  #         client_id:
+  #           type: env
+  #           var: GSUITE_OAUTH_CLIENT_ID
+  #         client_secret:        # omit for public (PKCE) clients
+  #           type: 1password_connect
+  #           secret_ref: "op://Engineering/GSUITE-OAUTH/client-secret"
   #         token_endpoint: "https://oauth2.googleapis.com/token"
   #         scopes:
   #           - "https://www.googleapis.com/auth/gmail.readonly"
   #         rules:
   #           - host: "gmail.googleapis.com"
-  #       - grant: jwt_bearer
-  #         credential:
-  #           type: 1password_connect
-  #           secret_ref: "op://Engineering/BIGQUERY-SA/credential"
-  #         subject: ""   # set for Workspace domain-wide delegation
-  #         scopes:
-  #           - "https://www.googleapis.com/auth/bigquery.readonly"
+  #       # Both fields pulled out of one JSON secret with json_key.
+  #       - grant: client_credentials
+  #         client_id:
+  #           type: aws_sm
+  #           secret_id: "arn:aws:secretsmanager:us-east-1:123:secret:oauth"
+  #           json_key: "client_id"
+  #         client_secret:
+  #           type: aws_sm
+  #           secret_id: "arn:aws:secretsmanager:us-east-1:123:secret:oauth"
+  #           json_key: "client_secret"
+  #         token_endpoint: "https://login.example.com/oauth2/token"
   #         rules:
-  #           - host: "bigquery.googleapis.com"
+  #           - host: "api.example.com"
 
   # Header allowlist: strips any request header not listed below before the
   # request goes upstream. Default-deny — every header must either match a

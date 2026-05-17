@@ -2,18 +2,13 @@ package oauth
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
-	"encoding/pem"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -43,6 +38,24 @@ func (s *staticSource) Get(context.Context) (string, error) {
 
 func staticBuilder(src secrets.Source) sourceBuilder {
 	return func(yaml.Node, *slog.Logger) (secrets.Source, error) { return src, nil }
+}
+
+// mapBuilder dispatches each credential node to a source keyed by the node's
+// "var" field, so discrete-source tests can give every field its own value.
+func mapBuilder(srcs map[string]secrets.Source) sourceBuilder {
+	return func(n yaml.Node, _ *slog.Logger) (secrets.Source, error) {
+		var c struct {
+			Var string `yaml:"var"`
+		}
+		if err := n.Decode(&c); err != nil {
+			return nil, err
+		}
+		src, ok := srcs[c.Var]
+		if !ok {
+			return nil, fmt.Errorf("no test source for var %q", c.Var)
+		}
+		return src, nil
+	}
 }
 
 // tokenServer is a fake OAuth2 token endpoint. It counts requests and records
@@ -96,52 +109,13 @@ func newTokenServer(t *testing.T, respond func(form url.Values) (int, map[string
 	return ts
 }
 
-// --- credential blob builders ---
-
-// keyfileJSON generates a GCP service-account keyfile whose JWT-bearer
-// exchange targets tokenURL.
-func keyfileJSON(t *testing.T, tokenURL string) []byte {
-	t.Helper()
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
-	der, err := x509.MarshalPKCS8PrivateKey(key)
-	require.NoError(t, err)
-	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
-	data, err := json.Marshal(map[string]string{
-		"type":           "service_account",
-		"project_id":     "test-project",
-		"private_key_id": "test-key-id",
-		"private_key":    string(pemBytes),
-		"client_email":   "sa@test-project.iam.gserviceaccount.com",
-		"token_uri":      tokenURL,
+// ccBuilder is a source builder for a client_credentials entry whose discrete
+// client_id and client_secret resolve to fixed test values.
+func ccBuilder() sourceBuilder {
+	return mapBuilder(map[string]secrets.Source{
+		"CID":     &staticSource{name: "cid", value: "test-client-id"},
+		"CSECRET": &staticSource{name: "cs", value: "test-client-secret"},
 	})
-	require.NoError(t, err)
-	return data
-}
-
-func refreshTokenJSON(t *testing.T, tokenURI string) []byte {
-	t.Helper()
-	blob := map[string]any{
-		"refresh_token": "test-refresh-token",
-		"client_id":     "test-client-id",
-		"client_secret": "test-client-secret",
-	}
-	if tokenURI != "" {
-		blob["token_uri"] = tokenURI
-	}
-	data, err := json.Marshal(blob)
-	require.NoError(t, err)
-	return data
-}
-
-func clientCredentialsJSON(t *testing.T) []byte {
-	t.Helper()
-	data, err := json.Marshal(map[string]string{
-		"client_id":     "test-client-id",
-		"client_secret": "test-client-secret",
-	})
-	require.NoError(t, err)
-	return data
 }
 
 // --- generic helpers ---
@@ -164,14 +138,14 @@ func newContext() *transform.TransformContext {
 	return &transform.TransformContext{Mode: transform.ModeMITM}
 }
 
-// buildTransform decodes cfgYAML and builds the transform with a static
-// credential source, so tests never reach a real secret backend.
-func buildTransform(t *testing.T, cfgYAML string, src secrets.Source) *OAuth {
+// buildTransformWith decodes cfgYAML and builds the transform with a custom
+// source builder, so tests never reach a real secret backend.
+func buildTransformWith(t *testing.T, cfgYAML string, build sourceBuilder) *OAuth {
 	t.Helper()
 	var c config
 	node := yamlFromString(t, cfgYAML)
 	require.NoError(t, node.Decode(&c))
-	o, err := newFromConfig(c, slog.Default(), staticBuilder(src))
+	o, err := newFromConfig(c, slog.Default(), build)
 	require.NoError(t, err)
 	return o
 }
@@ -188,17 +162,6 @@ func decodeBody(t *testing.T, resp *http.Response) []byte {
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	return body
-}
-
-func decodeJWTClaims(t *testing.T, assertion string) map[string]any {
-	t.Helper()
-	parts := strings.Split(assertion, ".")
-	require.Len(t, parts, 3, "assertion is not a JWT")
-	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
-	require.NoError(t, err)
-	var claims map[string]any
-	require.NoError(t, json.Unmarshal(raw, &claims))
-	return claims
 }
 
 // --- validation ---
@@ -218,41 +181,32 @@ func TestValidation(t *testing.T) {
 			name: "unknown grant",
 			yaml: `
 tokens:
-  - grant: password
-    credential: {type: env, var: X}
+  - grant: jwt_bearer
+    client_id: {type: env, var: CID}
     rules:
       - host: "example.com"
 `,
 			wantError: "\"grant\" must be one of",
 		},
 		{
-			name: "missing credential",
-			yaml: `
-tokens:
-  - grant: jwt_bearer
-    rules:
-      - host: "example.com"
-`,
-			wantError: "\"credential\" is required",
-		},
-		{
-			name: "subject on non-jwt grant",
+			name: "refresh_token without token_endpoint",
 			yaml: `
 tokens:
   - grant: refresh_token
-    credential: {type: env, var: X}
-    subject: user@example.com
+    refresh_token: {type: env, var: RT}
+    client_id: {type: env, var: CID}
     rules:
       - host: "example.com"
 `,
-			wantError: "\"subject\" is only valid for the jwt_bearer grant",
+			wantError: "refresh_token grant requires \"token_endpoint\"",
 		},
 		{
 			name: "client_credentials without token_endpoint",
 			yaml: `
 tokens:
   - grant: client_credentials
-    credential: {type: env, var: X}
+    client_id: {type: env, var: CID}
+    client_secret: {type: env, var: CSECRET}
     rules:
       - host: "example.com"
 `,
@@ -262,10 +216,48 @@ tokens:
 			name: "missing rules",
 			yaml: `
 tokens:
-  - grant: jwt_bearer
-    credential: {type: env, var: X}
+  - grant: client_credentials
+    client_id: {type: env, var: CID}
+    client_secret: {type: env, var: CSECRET}
+    token_endpoint: "https://t.example.com/token"
 `,
 			wantError: "at least one entry in \"rules\"",
+		},
+		{
+			name: "refresh_token missing client_id",
+			yaml: `
+tokens:
+  - grant: refresh_token
+    refresh_token: {type: env, var: RT}
+    token_endpoint: "https://t.example.com/token"
+    rules:
+      - host: "example.com"
+`,
+			wantError: "requires \"client_id\"",
+		},
+		{
+			name: "refresh_token missing refresh_token",
+			yaml: `
+tokens:
+  - grant: refresh_token
+    client_id: {type: env, var: CID}
+    token_endpoint: "https://t.example.com/token"
+    rules:
+      - host: "example.com"
+`,
+			wantError: "requires \"refresh_token\"",
+		},
+		{
+			name: "client_credentials missing client_secret",
+			yaml: `
+tokens:
+  - grant: client_credentials
+    client_id: {type: env, var: CID}
+    token_endpoint: "https://t.example.com/token"
+    rules:
+      - host: "example.com"
+`,
+			wantError: "requires \"client_id\" and \"client_secret\"",
 		},
 	}
 	for _, tc := range cases {
@@ -281,19 +273,25 @@ tokens:
 
 // --- refresh_token grant ---
 
+// refresh_token, client_id, and client_secret are resolved from separate
+// secret sources.
 func TestRefreshTokenGrant_InjectsBearer(t *testing.T) {
 	srv := newTokenServer(t, nil)
-	tokenURL := srv.URL + "/token"
-	src := &staticSource{name: "op://ai-agents/GSUITE", value: string(refreshTokenJSON(t, tokenURL))}
-
-	o := buildTransform(t, `
+	o := buildTransformWith(t, `
 tokens:
   - grant: refresh_token
-    credential: {type: env, var: X}
+    refresh_token: {type: env, var: RT}
+    client_id: {type: env, var: CID}
+    client_secret: {type: env, var: CSECRET}
+    token_endpoint: "`+srv.URL+`/token"
     scopes: ["https://www.googleapis.com/auth/gmail.readonly"]
     rules:
       - host: "gmail.googleapis.com"
-`, src)
+`, mapBuilder(map[string]secrets.Source{
+		"RT":      &staticSource{name: "rt", value: "discrete-refresh-token"},
+		"CID":     &staticSource{name: "cid", value: "discrete-client-id"},
+		"CSECRET": &staticSource{name: "cs", value: "discrete-client-secret"},
+	}))
 
 	req := newRequest(t, http.MethodGet, "https://gmail.googleapis.com/gmail/v1/users/me/messages")
 	res, err := o.TransformRequest(context.Background(), newContext(), req)
@@ -303,101 +301,49 @@ tokens:
 
 	form := srv.LastForm()
 	require.Equal(t, "refresh_token", form.Get("grant_type"))
-	require.Equal(t, "test-refresh-token", form.Get("refresh_token"))
-	require.Equal(t, "test-client-id", form.Get("client_id"))
-	require.Equal(t, "test-client-secret", form.Get("client_secret"), "client auth must be in the form body")
+	require.Equal(t, "discrete-refresh-token", form.Get("refresh_token"))
+	require.Equal(t, "discrete-client-id", form.Get("client_id"))
+	require.Equal(t, "discrete-client-secret", form.Get("client_secret"), "client auth must be in the form body")
 }
 
-// The token endpoint comes from the credential blob's token_uri when no
-// token_endpoint is configured.
-func TestRefreshTokenGrant_TokenURIFromBlobOnly(t *testing.T) {
+// A public client has no client_secret: the field is omitted entirely.
+func TestRefreshTokenGrant_PublicClient(t *testing.T) {
 	srv := newTokenServer(t, nil)
-	src := &staticSource{name: "blob", value: string(refreshTokenJSON(t, srv.URL+"/token"))}
-
-	o := buildTransform(t, `
+	o := buildTransformWith(t, `
 tokens:
   - grant: refresh_token
-    credential: {type: env, var: X}
+    refresh_token: {type: env, var: RT}
+    client_id: {type: env, var: CID}
+    token_endpoint: "`+srv.URL+`/token"
     rules:
       - host: "gmail.googleapis.com"
-`, src)
+`, mapBuilder(map[string]secrets.Source{
+		"RT":  &staticSource{name: "rt", value: "discrete-refresh-token"},
+		"CID": &staticSource{name: "cid", value: "discrete-client-id"},
+	}))
 
 	req := newRequest(t, http.MethodGet, "https://gmail.googleapis.com/v1/x")
 	res, err := o.TransformRequest(context.Background(), newContext(), req)
 	require.NoError(t, err)
 	require.Equal(t, transform.ActionContinue, res.Action)
 	require.Equal(t, "Bearer minted-token", req.Header.Get("Authorization"))
-	require.Equal(t, 1, srv.Calls())
-}
-
-// --- jwt_bearer grant ---
-
-func TestJWTBearerGrant_WithoutSubject(t *testing.T) {
-	srv := newTokenServer(t, nil)
-	src := &staticSource{name: "keyfile", value: string(keyfileJSON(t, srv.URL+"/token"))}
-
-	o := buildTransform(t, `
-tokens:
-  - grant: jwt_bearer
-    credential: {type: env, var: X}
-    scopes: ["https://www.googleapis.com/auth/bigquery.readonly"]
-    rules:
-      - host: "bigquery.googleapis.com"
-`, src)
-
-	req := newRequest(t, http.MethodGet, "https://bigquery.googleapis.com/bigquery/v2/projects/p/queries")
-	res, err := o.TransformRequest(context.Background(), newContext(), req)
-	require.NoError(t, err)
-	require.Equal(t, transform.ActionContinue, res.Action)
-	require.Equal(t, "Bearer minted-token", req.Header.Get("Authorization"))
-
-	form := srv.LastForm()
-	require.Equal(t, "urn:ietf:params:oauth:grant-type:jwt-bearer", form.Get("grant_type"))
-	claims := decodeJWTClaims(t, form.Get("assertion"))
-	require.Equal(t, "sa@test-project.iam.gserviceaccount.com", claims["iss"])
-	require.NotContains(t, claims, "sub", "no subject configured: assertion must not impersonate")
-}
-
-func TestJWTBearerGrant_WithSubject(t *testing.T) {
-	srv := newTokenServer(t, nil)
-	src := &staticSource{name: "keyfile", value: string(keyfileJSON(t, srv.URL+"/token"))}
-
-	o := buildTransform(t, `
-tokens:
-  - grant: jwt_bearer
-    credential: {type: env, var: X}
-    scopes: ["https://www.googleapis.com/auth/gmail.readonly"]
-    subject: "user@workspace.example.com"
-    rules:
-      - host: "gmail.googleapis.com"
-`, src)
-
-	req := newRequest(t, http.MethodGet, "https://gmail.googleapis.com/v1/x")
-	tctx := newContext()
-	res, err := o.TransformRequest(context.Background(), tctx, req)
-	require.NoError(t, err)
-	require.Equal(t, transform.ActionContinue, res.Action)
-
-	claims := decodeJWTClaims(t, srv.LastForm().Get("assertion"))
-	require.Equal(t, "user@workspace.example.com", claims["sub"], "subject must impersonate the configured user")
-	require.Equal(t, "user@workspace.example.com", tctx.DrainAnnotations()["subject"])
+	require.Empty(t, srv.LastForm().Get("client_secret"), "a public client sends no client_secret")
 }
 
 // --- client_credentials grant ---
 
 func TestClientCredentialsGrant_InjectsBearer(t *testing.T) {
 	srv := newTokenServer(t, nil)
-	src := &staticSource{name: "creds", value: string(clientCredentialsJSON(t))}
-
-	o := buildTransform(t, `
+	o := buildTransformWith(t, `
 tokens:
   - grant: client_credentials
-    credential: {type: env, var: X}
+    client_id: {type: env, var: CID}
+    client_secret: {type: env, var: CSECRET}
     token_endpoint: "`+srv.URL+`/token"
     scopes: ["api.read"]
     rules:
       - host: "api.example.com"
-`, src)
+`, ccBuilder())
 
 	req := newRequest(t, http.MethodGet, "https://api.example.com/v1/things")
 	res, err := o.TransformRequest(context.Background(), newContext(), req)
@@ -416,16 +362,15 @@ tokens:
 
 func TestCachesTokenAcrossRequests(t *testing.T) {
 	srv := newTokenServer(t, nil)
-	src := &staticSource{name: "creds", value: string(clientCredentialsJSON(t))}
-
-	o := buildTransform(t, `
+	o := buildTransformWith(t, `
 tokens:
   - grant: client_credentials
-    credential: {type: env, var: X}
+    client_id: {type: env, var: CID}
+    client_secret: {type: env, var: CSECRET}
     token_endpoint: "`+srv.URL+`/token"
     rules:
       - host: "api.example.com"
-`, src)
+`, ccBuilder())
 
 	for i := 0; i < 5; i++ {
 		req := newRequest(t, http.MethodGet, "https://api.example.com/v1/x")
@@ -438,16 +383,15 @@ tokens:
 
 func TestConcurrentRequestsTriggerSingleRefresh(t *testing.T) {
 	srv := newTokenServer(t, nil)
-	src := &staticSource{name: "creds", value: string(clientCredentialsJSON(t))}
-
-	o := buildTransform(t, `
+	o := buildTransformWith(t, `
 tokens:
   - grant: client_credentials
-    credential: {type: env, var: X}
+    client_id: {type: env, var: CID}
+    client_secret: {type: env, var: CSECRET}
     token_endpoint: "`+srv.URL+`/token"
     rules:
       - host: "api.example.com"
-`, src)
+`, ccBuilder())
 
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
@@ -465,16 +409,15 @@ tokens:
 
 func TestNoMatchingEntryPassesThrough(t *testing.T) {
 	srv := newTokenServer(t, nil)
-	src := &staticSource{name: "creds", value: string(clientCredentialsJSON(t))}
-
-	o := buildTransform(t, `
+	o := buildTransformWith(t, `
 tokens:
   - grant: client_credentials
-    credential: {type: env, var: X}
+    client_id: {type: env, var: CID}
+    client_secret: {type: env, var: CSECRET}
     token_endpoint: "`+srv.URL+`/token"
     rules:
       - host: "api.example.com"
-`, src)
+`, ccBuilder())
 
 	req := newRequest(t, http.MethodGet, "https://other.example.org/v1/x")
 	res, err := o.TransformRequest(context.Background(), newContext(), req)
@@ -486,16 +429,15 @@ tokens:
 
 func TestOverwritesExistingAuthorizationHeader(t *testing.T) {
 	srv := newTokenServer(t, nil)
-	src := &staticSource{name: "creds", value: string(clientCredentialsJSON(t))}
-
-	o := buildTransform(t, `
+	o := buildTransformWith(t, `
 tokens:
   - grant: client_credentials
-    credential: {type: env, var: X}
+    client_id: {type: env, var: CID}
+    client_secret: {type: env, var: CSECRET}
     token_endpoint: "`+srv.URL+`/token"
     rules:
       - host: "api.example.com"
-`, src)
+`, ccBuilder())
 
 	req := newRequest(t, http.MethodGet, "https://api.example.com/v1/x")
 	req.Header.Set("Authorization", "Bearer client-supplied-token")
@@ -513,23 +455,23 @@ func TestFirstMatchingEntryWins(t *testing.T) {
 			"expires_in":   3600,
 		}
 	})
-	src := &staticSource{name: "creds", value: string(clientCredentialsJSON(t))}
-
-	o := buildTransform(t, `
+	o := buildTransformWith(t, `
 tokens:
   - grant: client_credentials
-    credential: {type: env, var: X}
+    client_id: {type: env, var: CID}
+    client_secret: {type: env, var: CSECRET}
     token_endpoint: "`+srv.URL+`/token"
     scopes: ["first"]
     rules:
       - host: "*.example.com"
   - grant: client_credentials
-    credential: {type: env, var: X}
+    client_id: {type: env, var: CID}
+    client_secret: {type: env, var: CSECRET}
     token_endpoint: "`+srv.URL+`/token"
     scopes: ["second"]
     rules:
       - host: "api.example.com"
-`, src)
+`, ccBuilder())
 
 	req := newRequest(t, http.MethodGet, "https://api.example.com/v1/x")
 	_, err := o.TransformRequest(context.Background(), newContext(), req)
@@ -542,19 +484,19 @@ tokens:
 func TestStubsConfiguredTokenEndpoint(t *testing.T) {
 	srv := newTokenServer(t, nil)
 	tokenURL := srv.URL + "/token"
-	src := &staticSource{name: "keyfile", value: string(keyfileJSON(t, tokenURL))}
 
 	// rules target the API host on purpose: stubbing must not depend on the
 	// rules matching the token endpoint.
-	o := buildTransform(t, `
+	o := buildTransformWith(t, `
 tokens:
-  - grant: jwt_bearer
-    credential: {type: env, var: X}
+  - grant: client_credentials
+    client_id: {type: env, var: CID}
+    client_secret: {type: env, var: CSECRET}
     token_endpoint: "`+tokenURL+`"
-    scopes: ["https://www.googleapis.com/auth/bigquery"]
+    scopes: ["api.read"]
     rules:
-      - host: "bigquery.googleapis.com"
-`, src)
+      - host: "api.example.com"
+`, ccBuilder())
 
 	req := newRequest(t, http.MethodPost, tokenURL)
 	tctx := newContext()
@@ -574,17 +516,17 @@ tokens:
 // A non-token path on the token endpoint host is not stubbed.
 func TestDoesNotStubOtherPaths(t *testing.T) {
 	srv := newTokenServer(t, nil)
-	src := &staticSource{name: "keyfile", value: string(keyfileJSON(t, srv.URL+"/token"))}
 
-	o := buildTransform(t, `
+	o := buildTransformWith(t, `
 tokens:
-  - grant: jwt_bearer
-    credential: {type: env, var: X}
+  - grant: client_credentials
+    client_id: {type: env, var: CID}
+    client_secret: {type: env, var: CSECRET}
     token_endpoint: "`+srv.URL+`/token"
     scopes: ["s"]
     rules:
-      - host: "bigquery.googleapis.com"
-`, src)
+      - host: "api.example.com"
+`, ccBuilder())
 
 	req := newRequest(t, http.MethodGet, srv.URL+"/revoke")
 	res, err := o.TransformRequest(context.Background(), newContext(), req)
@@ -601,15 +543,20 @@ func TestInvalidGrantFails502(t *testing.T) {
 			"error_description": "Token has been expired or revoked.",
 		}
 	})
-	src := &staticSource{name: "blob", value: string(refreshTokenJSON(t, srv.URL+"/token"))}
-
-	o := buildTransform(t, `
+	o := buildTransformWith(t, `
 tokens:
   - grant: refresh_token
-    credential: {type: env, var: X}
+    refresh_token: {type: env, var: RT}
+    client_id: {type: env, var: CID}
+    client_secret: {type: env, var: CSECRET}
+    token_endpoint: "`+srv.URL+`/token"
     rules:
       - host: "gmail.googleapis.com"
-`, src)
+`, mapBuilder(map[string]secrets.Source{
+		"RT":      &staticSource{name: "rt", value: "test-refresh-token"},
+		"CID":     &staticSource{name: "cid", value: "test-client-id"},
+		"CSECRET": &staticSource{name: "cs", value: "test-client-secret"},
+	}))
 
 	req := newRequest(t, http.MethodGet, "https://gmail.googleapis.com/v1/x")
 	tctx := newContext()
@@ -628,16 +575,18 @@ tokens:
 }
 
 func TestCredentialUnavailableFails502(t *testing.T) {
-	src := &staticSource{name: "blob", err: io.ErrUnexpectedEOF}
-
-	o := buildTransform(t, `
+	o := buildTransformWith(t, `
 tokens:
   - grant: refresh_token
-    credential: {type: env, var: X}
+    refresh_token: {type: env, var: RT}
+    client_id: {type: env, var: CID}
     token_endpoint: "https://oauth2.example.com/token"
     rules:
       - host: "gmail.googleapis.com"
-`, src)
+`, mapBuilder(map[string]secrets.Source{
+		"RT":  &staticSource{name: "rt", err: io.ErrUnexpectedEOF},
+		"CID": &staticSource{name: "cid", value: "test-client-id"},
+	}))
 
 	req := newRequest(t, http.MethodGet, "https://gmail.googleapis.com/v1/x")
 	res, err := o.TransformRequest(context.Background(), newContext(), req)
@@ -650,14 +599,18 @@ tokens:
 
 func TestFactory_EndToEnd(t *testing.T) {
 	srv := newTokenServer(t, nil)
-	t.Setenv("OAUTH_CREDENTIAL", string(clientCredentialsJSON(t)))
+	t.Setenv("OAUTH_CLIENT_ID", "test-client-id")
+	t.Setenv("OAUTH_CLIENT_SECRET", "test-client-secret")
 
 	tr, err := factory(yamlFromString(t, `
 tokens:
   - grant: client_credentials
-    credential:
+    client_id:
       type: env
-      var: OAUTH_CREDENTIAL
+      var: OAUTH_CLIENT_ID
+    client_secret:
+      type: env
+      var: OAUTH_CLIENT_SECRET
     token_endpoint: "`+srv.URL+`/token"
     rules:
       - host: "api.example.com"

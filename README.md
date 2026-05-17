@@ -390,9 +390,9 @@ Secret sources:
 
 - **`env`:** reads `var` from the proxy process environment.
 - **`aws_sm`:** reads `secret_id` from AWS Secrets Manager. Optional `region`,
-  `json_key`, `ttl`, and `failure_ttl` are supported.
+  `ttl`, and `failure_ttl` are supported.
 - **`aws_ssm`:** reads `name` from AWS Systems Manager Parameter Store. Optional
-  `region`, `with_decryption`, `json_key`, `ttl`, and `failure_ttl` are supported.
+  `region`, `with_decryption`, `ttl`, and `failure_ttl` are supported.
   `with_decryption` defaults to `true`, which is the expected setting for
   `SecureString` parameters.
 - **`1password`:** resolves `secret_ref` (an `op://vault/item/[section/]field`
@@ -404,6 +404,10 @@ Secret sources:
   is read from `OP_CONNECT_HOST` and the API token from `OP_CONNECT_TOKEN` by
   default; override with `host_env` and `token_env`. Optional `ttl` and
   `failure_ttl` are supported.
+
+Every source also accepts an optional `json_key`. When set, the resolved value
+is parsed as a JSON object and the single top-level string field at that key is
+extracted. Use it to pull one field out of a JSON secret.
 
 `ttl` controls how long a successfully fetched value is cached before refresh
 (empty caches forever). `failure_ttl` controls how long a fetch error is

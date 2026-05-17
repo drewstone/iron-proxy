@@ -150,24 +150,6 @@ func TestAWSSMBuilder_PlainString(t *testing.T) {
 	require.Equal(t, "my-secret-value", val)
 }
 
-func TestAWSSMBuilder_JSONKey(t *testing.T) {
-	client := staticSMClient(&secretsmanager.GetSecretValueOutput{
-		SecretString: aws.String(`{"api_key": "sk-abc123", "other": "val"}`),
-	}, nil)
-	r := newTestAWSSMBuilder(client)
-	node := yamlNode(t, map[string]string{
-		"type":      "aws_sm",
-		"secret_id": "arn:aws:sm:us-east-1:123:secret:foo",
-		"json_key":  "api_key",
-	})
-	result, err := r.Build(node)
-	require.NoError(t, err)
-
-	val, err := result.Get(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, "sk-abc123", val)
-}
-
 func TestAWSSMBuilder_TTLReturnsCachedValue(t *testing.T) {
 	client := staticSMClient(&secretsmanager.GetSecretValueOutput{
 		SecretString: aws.String("value"),
@@ -227,33 +209,6 @@ func TestAWSSMBuilder_Errors(t *testing.T) {
 			errMsg: "empty value",
 			errAt:  "fetch",
 		},
-		{
-			name: "json_key with invalid JSON",
-			client: staticSMClient(&secretsmanager.GetSecretValueOutput{
-				SecretString: aws.String("not-json"),
-			}, nil),
-			input:  map[string]string{"type": "aws_sm", "secret_id": "arn:foo", "json_key": "api_key"},
-			errMsg: "not valid JSON",
-			errAt:  "fetch",
-		},
-		{
-			name: "json_key not found",
-			client: staticSMClient(&secretsmanager.GetSecretValueOutput{
-				SecretString: aws.String(`{"other": "value"}`),
-			}, nil),
-			input:  map[string]string{"type": "aws_sm", "secret_id": "arn:foo", "json_key": "api_key"},
-			errMsg: "not found",
-			errAt:  "fetch",
-		},
-		{
-			name: "json_key non-string value",
-			client: staticSMClient(&secretsmanager.GetSecretValueOutput{
-				SecretString: aws.String(`{"api_key": 123}`),
-			}, nil),
-			input:  map[string]string{"type": "aws_sm", "secret_id": "arn:foo", "json_key": "api_key"},
-			errMsg: "not a string",
-			errAt:  "fetch",
-		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -288,24 +243,6 @@ func TestAWSSSMBuilder_PlainString(t *testing.T) {
 	val, err := result.Get(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, "my-param-value", val)
-}
-
-func TestAWSSSMBuilder_JSONKey(t *testing.T) {
-	client := staticSSMClient(&ssm.GetParameterOutput{
-		Parameter: &ssmtypes.Parameter{Value: aws.String(`{"api_key": "sk-abc123", "other": "val"}`)},
-	}, nil)
-	r := newTestAWSSSMBuilder(client)
-	node := yamlNode(t, map[string]string{
-		"type":     "aws_ssm",
-		"name":     "/myapp/config",
-		"json_key": "api_key",
-	})
-	result, err := r.Build(node)
-	require.NoError(t, err)
-
-	val, err := result.Get(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, "sk-abc123", val)
 }
 
 func TestAWSSSMBuilder_TTLReturnsCachedValue(t *testing.T) {
@@ -446,15 +383,6 @@ func TestAWSSSMBuilder_Errors(t *testing.T) {
 			errMsg: "without a value",
 			errAt:  "fetch",
 		},
-		{
-			name: "json_key with invalid JSON",
-			client: staticSSMClient(&ssm.GetParameterOutput{
-				Parameter: &ssmtypes.Parameter{Value: aws.String("not-json")},
-			}, nil),
-			input:  map[string]string{"type": "aws_ssm", "name": "/myapp/key", "json_key": "api_key"},
-			errMsg: "not valid JSON",
-			errAt:  "fetch",
-		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -519,6 +447,82 @@ func TestExtractJSONKey(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, tt.want, val)
 			}
+		})
+	}
+}
+
+// --- json_key via resolveSource (available to every source type) ---
+
+func TestResolveSource_JSONKey(t *testing.T) {
+	const blob = `{"refresh_token": "rt-123", "client_id": "cid", "num": 42}`
+
+	t.Run("extracts field from env source", func(t *testing.T) {
+		reg := sourceBuilderRegistry{"env": &envBuilder{
+			getenv: func(string) string { return blob },
+			logger: slog.Default(),
+		}}
+		node := yamlNode(t, map[string]string{"type": "env", "var": "CRED", "json_key": "refresh_token"})
+		src, err := resolveSource(reg, node)
+		require.NoError(t, err)
+
+		val, err := src.Get(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, "rt-123", val)
+	})
+
+	t.Run("extracts field from aws_sm source", func(t *testing.T) {
+		reg := sourceBuilderRegistry{"aws_sm": newTestAWSSMBuilder(staticSMClient(
+			&secretsmanager.GetSecretValueOutput{SecretString: aws.String(blob)}, nil,
+		))}
+		node := yamlNode(t, map[string]string{
+			"type":      "aws_sm",
+			"secret_id": "arn:foo",
+			"json_key":  "client_id",
+		})
+		src, err := resolveSource(reg, node)
+		require.NoError(t, err)
+
+		val, err := src.Get(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, "cid", val)
+	})
+
+	t.Run("without json_key returns the raw value", func(t *testing.T) {
+		reg := sourceBuilderRegistry{"env": &envBuilder{
+			getenv: func(string) string { return blob },
+			logger: slog.Default(),
+		}}
+		node := yamlNode(t, map[string]string{"type": "env", "var": "CRED"})
+		src, err := resolveSource(reg, node)
+		require.NoError(t, err)
+
+		val, err := src.Get(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, blob, val)
+	})
+
+	errCases := []struct {
+		name   string
+		value  string
+		key    string
+		errMsg string
+	}{
+		{name: "invalid JSON", value: "not-json", key: "refresh_token", errMsg: "not valid JSON"},
+		{name: "key not found", value: blob, key: "missing", errMsg: "not found"},
+		{name: "non-string value", value: blob, key: "num", errMsg: "not a string"},
+	}
+	for _, tc := range errCases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := sourceBuilderRegistry{"env": &envBuilder{
+				getenv: func(string) string { return tc.value },
+				logger: slog.Default(),
+			}}
+			node := yamlNode(t, map[string]string{"type": "env", "var": "CRED", "json_key": tc.key})
+			src, err := resolveSource(reg, node)
+			require.NoError(t, err)
+
+			_, err = src.Get(context.Background())
+			require.ErrorContains(t, err, tc.errMsg)
 		})
 	}
 }
