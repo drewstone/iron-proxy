@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -427,4 +429,70 @@ rules:
 	require.NoError(t, err)
 	require.Equal(t, transform.ActionContinue, res.Action)
 	require.Equal(t, "Bearer factory-token", req.Header.Get("Authorization"))
+}
+
+// decodeJWTClaims base64-decodes the payload segment of a JWT.
+func decodeJWTClaims(t *testing.T, assertion string) map[string]any {
+	t.Helper()
+	parts := strings.Split(assertion, ".")
+	require.Len(t, parts, 3, "assertion is not a JWT")
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	require.NoError(t, err)
+	var claims map[string]any
+	require.NoError(t, json.Unmarshal(raw, &claims))
+	return claims
+}
+
+// TestGCPAuth_Subject verifies that the subject field drives domain-wide
+// delegation: the minted assertion's sub claim impersonates the configured
+// Workspace user, and is absent when no subject is set.
+func TestGCPAuth_Subject(t *testing.T) {
+	cases := []struct {
+		name    string
+		subject string
+	}{
+		{name: "with subject", subject: "user@workspace.example.com"},
+		{name: "without subject", subject: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var assertion atomic.Value
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				require.NoError(t, r.ParseForm())
+				assertion.Store(r.PostForm.Get("assertion"))
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"access_token": "minted-token",
+					"token_type":   "Bearer",
+					"expires_in":   3600,
+				})
+			}))
+			t.Cleanup(srv.Close)
+
+			path := filepath.Join(t.TempDir(), "sa.json")
+			require.NoError(t, os.WriteFile(path, testKeyfileJSON(t, srv.URL, "sa@p.iam.gserviceaccount.com"), 0o600))
+
+			cfg := config{
+				KeyfilePath: path,
+				Subject:     tc.subject,
+				Scopes:      []string{"https://www.googleapis.com/auth/cloud-platform"},
+			}
+			g, err := newFromConfig(cfg, slog.Default(), os.ReadFile, staticBuilder(&staticSource{}))
+			require.NoError(t, err)
+
+			req := newRequest(t, "storage.googleapis.com")
+			res, err := g.TransformRequest(context.Background(), newContext(), req)
+			require.NoError(t, err)
+			require.Equal(t, transform.ActionContinue, res.Action)
+			require.Equal(t, "Bearer minted-token", req.Header.Get("Authorization"))
+
+			claims := decodeJWTClaims(t, assertion.Load().(string))
+			require.Equal(t, "sa@p.iam.gserviceaccount.com", claims["iss"])
+			if tc.subject == "" {
+				require.NotContains(t, claims, "sub", "no subject: the assertion must not impersonate")
+			} else {
+				require.Equal(t, tc.subject, claims["sub"], "subject must impersonate the configured user")
+			}
+		})
+	}
 }

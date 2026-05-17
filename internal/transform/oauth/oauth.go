@@ -1,16 +1,15 @@
 // Package oauth implements a transform that mints OAuth2 access tokens and
 // injects them as Authorization: Bearer headers on matching requests.
 //
-// One oauth_token transform carries a list of token entries. Each entry
-// names an OAuth2 grant (refresh_token, jwt_bearer, or client_credentials), a
-// credential resolved from any secrets-package source (env, 1password,
-// 1password_connect, aws_sm, aws_ssm), and host rules selecting the requests
+// One oauth_token transform carries a list of token entries. Each entry names
+// an OAuth2 grant (refresh_token or client_credentials), the credential fields
+// it needs — each resolved from any secrets-package source (env, 1password,
+// 1password_connect, aws_sm, aws_ssm) — and host rules selecting the requests
 // it applies to. Token exchange, caching, refresh, and single-flight are
 // delegated to golang.org/x/oauth2 — the same code path the official SDKs use.
 //
-// jwt_bearer is a strict superset of the older gcp_auth transform: same
-// JWT-bearer exchange, plus a subject field for Workspace domain-wide
-// delegation.
+// GCP service-account auth (the RFC 7523 JWT-bearer grant against a Google
+// keyfile) is handled by the separate gcp_auth transform.
 //
 // Like all header-injecting transforms, this requires MITM mode; sni-only
 // mode has no way to rewrite headers.
@@ -34,8 +33,16 @@ import (
 
 const (
 	grantRefreshToken      = "refresh_token"
-	grantJWTBearer         = "jwt_bearer"
 	grantClientCredentials = "client_credentials"
+)
+
+// Credential field keys. They name both a config field and the corresponding
+// key in the resolved-value map handed to the token-source builders, so the
+// two sides stay in sync.
+const (
+	fieldRefreshToken = "refresh_token"
+	fieldClientID     = "client_id"
+	fieldClientSecret = "client_secret"
 )
 
 // stubAccessToken is the placeholder bearer returned to clients that fetch a
@@ -56,11 +63,18 @@ type config struct {
 }
 
 type tokenEntryConfig struct {
-	Grant         string                 `yaml:"grant"`
-	Credential    yaml.Node              `yaml:"credential"`
+	Grant string `yaml:"grant"`
+
+	// RefreshToken, ClientID, and ClientSecret are the credential fields. Each
+	// is a secrets source resolved independently, so the fields can live in
+	// different stores or be pulled out of one JSON secret with json_key.
+	// ClientSecret is optional for public refresh_token clients.
+	RefreshToken yaml.Node `yaml:"refresh_token"`
+	ClientID     yaml.Node `yaml:"client_id"`
+	ClientSecret yaml.Node `yaml:"client_secret"`
+
 	TokenEndpoint string                 `yaml:"token_endpoint,omitempty"`
 	Scopes        []string               `yaml:"scopes,omitempty"`
-	Subject       string                 `yaml:"subject,omitempty"`
 	Rules         []hostmatch.RuleConfig `yaml:"rules"`
 	Header        string                 `yaml:"header,omitempty"`
 	ValuePrefix   string                 `yaml:"value_prefix,omitempty"`
@@ -80,19 +94,21 @@ type OAuth struct {
 type tokenEntry struct {
 	grant       string
 	scopes      []string
-	subject     string // jwt_bearer only
 	rules       []hostmatch.Rule
 	header      string
 	valuePrefix string
-	cfgEndpoint string // config token_endpoint, "" if unset
-	credential  secrets.Source
+	cfgEndpoint string // config token_endpoint
 	logger      *slog.Logger
 
-	// mu guards the lazily built token source and the credential blob it was
-	// built from. The token source is rebuilt when the blob changes (e.g. the
-	// credential's ttl expired and the secret store returned a new value).
+	// sources holds the entry's credential secret sources, keyed by field.
+	sources map[string]secrets.Source
+
+	// mu guards the lazily built token source and the fingerprint of the
+	// credential values it was built from. The token source is rebuilt when
+	// any source value changes (e.g. a credential's ttl expired and the secret
+	// store returned a new value).
 	mu          sync.Mutex
-	blob        string
+	fingerprint string
 	tokenSource oauth2.TokenSource
 }
 
@@ -129,20 +145,23 @@ func newFromConfig(c config, logger *slog.Logger, buildSource sourceBuilder) (*O
 	return o, nil
 }
 
+// isSet reports whether a credential yaml.Node was present in config. An
+// absent mapping field decodes to the zero Node, whose Kind is 0.
+func isSet(n yaml.Node) bool { return n.Kind != 0 }
+
 func buildEntry(tc tokenEntryConfig, logger *slog.Logger, buildSource sourceBuilder) (*tokenEntry, *tokenEndpoint, error) {
 	switch tc.Grant {
-	case grantRefreshToken, grantJWTBearer, grantClientCredentials:
+	case grantRefreshToken, grantClientCredentials:
 	default:
-		return nil, nil, fmt.Errorf("\"grant\" must be one of refresh_token, jwt_bearer, client_credentials (got %q)", tc.Grant)
+		return nil, nil, fmt.Errorf("\"grant\" must be one of refresh_token, client_credentials (got %q)", tc.Grant)
 	}
-	if tc.Credential.Kind == 0 {
-		return nil, nil, fmt.Errorf("\"credential\" is required")
+	if tc.TokenEndpoint == "" {
+		return nil, nil, fmt.Errorf("%s grant requires \"token_endpoint\"", tc.Grant)
 	}
-	if tc.Subject != "" && tc.Grant != grantJWTBearer {
-		return nil, nil, fmt.Errorf("\"subject\" is only valid for the jwt_bearer grant")
-	}
-	if tc.Grant == grantClientCredentials && tc.TokenEndpoint == "" {
-		return nil, nil, fmt.Errorf("client_credentials grant requires \"token_endpoint\"")
+
+	sources, err := buildCredentialSources(tc, logger, buildSource)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	rules, err := hostmatch.CompileRules(tc.Rules, "rules")
@@ -151,11 +170,6 @@ func buildEntry(tc tokenEntryConfig, logger *slog.Logger, buildSource sourceBuil
 	}
 	if len(rules) == 0 {
 		return nil, nil, fmt.Errorf("at least one entry in \"rules\" is required")
-	}
-
-	src, err := buildSource(tc.Credential, logger)
-	if err != nil {
-		return nil, nil, fmt.Errorf("building credential source: %w", err)
 	}
 
 	var stub *tokenEndpoint
@@ -178,14 +192,64 @@ func buildEntry(tc tokenEntryConfig, logger *slog.Logger, buildSource sourceBuil
 	return &tokenEntry{
 		grant:       tc.Grant,
 		scopes:      tc.Scopes,
-		subject:     tc.Subject,
 		rules:       rules,
 		header:      header,
 		valuePrefix: valuePrefix,
 		cfgEndpoint: tc.TokenEndpoint,
-		credential:  src,
+		sources:     sources,
 		logger:      logger,
 	}, stub, nil
+}
+
+// buildCredentialSources resolves an entry's credential secret sources, one
+// per field.
+func buildCredentialSources(tc tokenEntryConfig, logger *slog.Logger, buildSource sourceBuilder) (map[string]secrets.Source, error) {
+	build := func(field string, n yaml.Node) (secrets.Source, error) {
+		src, err := buildSource(n, logger)
+		if err != nil {
+			return nil, fmt.Errorf("building %s source: %w", field, err)
+		}
+		return src, nil
+	}
+	buildAll := func(fields map[string]yaml.Node) (map[string]secrets.Source, error) {
+		sources := make(map[string]secrets.Source, len(fields))
+		for field, node := range fields {
+			src, err := build(field, node)
+			if err != nil {
+				return nil, err
+			}
+			sources[field] = src
+		}
+		return sources, nil
+	}
+
+	switch tc.Grant {
+	case grantRefreshToken:
+		if !isSet(tc.RefreshToken) {
+			return nil, fmt.Errorf("refresh_token grant requires \"refresh_token\"")
+		}
+		if !isSet(tc.ClientID) {
+			return nil, fmt.Errorf("refresh_token grant requires \"client_id\"")
+		}
+		fields := map[string]yaml.Node{
+			fieldRefreshToken: tc.RefreshToken,
+			fieldClientID:     tc.ClientID,
+		}
+		if isSet(tc.ClientSecret) {
+			fields[fieldClientSecret] = tc.ClientSecret
+		}
+		return buildAll(fields)
+
+	case grantClientCredentials:
+		if !isSet(tc.ClientID) || !isSet(tc.ClientSecret) {
+			return nil, fmt.Errorf("client_credentials grant requires \"client_id\" and \"client_secret\"")
+		}
+		return buildAll(map[string]yaml.Node{
+			fieldClientID:     tc.ClientID,
+			fieldClientSecret: tc.ClientSecret,
+		})
+	}
+	return nil, fmt.Errorf("unknown grant %q", tc.Grant) // unreachable: grant is validated above
 }
 
 // parseTokenEndpoint splits a configured token endpoint URL into the host and
@@ -242,9 +306,6 @@ func (o *OAuth) TransformRequest(ctx context.Context, tctx *transform.TransformC
 
 	req.Header.Set(entry.header, entry.valuePrefix+tok)
 	tctx.Annotate("grant", entry.grant)
-	if entry.subject != "" {
-		tctx.Annotate("subject", entry.subject)
-	}
 	tctx.Annotate("injected", []string{"header:" + http.CanonicalHeaderKey(entry.header)})
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
 }

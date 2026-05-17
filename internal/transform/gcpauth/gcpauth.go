@@ -8,6 +8,10 @@
 // caching, and refresh are delegated to golang.org/x/oauth2/google — the same
 // code path the official GCP SDKs use.
 //
+// A non-empty subject impersonates that Workspace user via domain-wide
+// delegation: the minted token acts as the subject rather than the service
+// account itself.
+//
 // Like all header-injecting transforms, this requires MITM mode; sni-only
 // mode has no way to rewrite headers.
 package gcpauth
@@ -47,6 +51,7 @@ func init() {
 type config struct {
 	KeyfilePath string                 `yaml:"keyfile_path,omitempty"`
 	Keyfile     yaml.Node              `yaml:"keyfile,omitempty"`
+	Subject     string                 `yaml:"subject,omitempty"`
 	Scopes      []string               `yaml:"scopes"`
 	Rules       []hostmatch.RuleConfig `yaml:"rules"`
 }
@@ -54,6 +59,7 @@ type config struct {
 // GCPAuth is the transform.
 type GCPAuth struct {
 	scopes  []string
+	subject string           // Workspace user to impersonate; "" for none
 	rules   []hostmatch.Rule // empty = apply to all requests
 	loadKey func(ctx context.Context) ([]byte, error)
 	logger  *slog.Logger
@@ -115,6 +121,7 @@ func newFromConfig(c config, logger *slog.Logger, readFile func(string) ([]byte,
 
 	return &GCPAuth{
 		scopes:  c.Scopes,
+		subject: c.Subject,
 		rules:   rules,
 		loadKey: load,
 		logger:  logger,
@@ -193,6 +200,7 @@ func (g *GCPAuth) loadTokenSource(ctx context.Context) (oauth2.TokenSource, erro
 	if err != nil {
 		return nil, fmt.Errorf("parsing GCP service account keyfile: %w", err)
 	}
+	cfg.Subject = g.subject
 	var meta struct {
 		ClientEmail string `json:"client_email"`
 	}

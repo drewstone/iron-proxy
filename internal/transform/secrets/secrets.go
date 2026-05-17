@@ -153,7 +153,15 @@ func BuildSource(node yaml.Node, logger *slog.Logger) (Source, error) {
 	return resolveSource(defaultRegistry(logger), node)
 }
 
-// resolveSource dispatches a source config through the registry.
+// jsonKeyHint peeks at the optional json_key field, common to every source
+// type. When set, the source's value is parsed as a JSON object and the
+// single top-level string field at that key is extracted.
+type jsonKeyHint struct {
+	JSONKey string `yaml:"json_key"`
+}
+
+// resolveSource dispatches a source config through the registry and applies
+// the optional json_key extraction, which is available to every source type.
 func resolveSource(registry sourceBuilderRegistry, node yaml.Node) (secretSource, error) {
 	var hint sourceTypeHint
 	if err := node.Decode(&hint); err != nil {
@@ -166,7 +174,18 @@ func resolveSource(registry sourceBuilderRegistry, node yaml.Node) (secretSource
 	if !ok {
 		return nil, fmt.Errorf("unsupported source type %q", hint.Type)
 	}
-	return builder.Build(node)
+	src, err := builder.Build(node)
+	if err != nil {
+		return nil, err
+	}
+	var jk jsonKeyHint
+	if err := node.Decode(&jk); err != nil {
+		return nil, fmt.Errorf("parsing json_key: %w", err)
+	}
+	if jk.JSONKey != "" {
+		src = &jsonKeySource{inner: src, key: jk.JSONKey}
+	}
+	return src, nil
 }
 
 // newFromConfig creates a Secrets transform from a parsed config.
@@ -180,21 +199,7 @@ func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets,
 			return nil, err
 		}
 
-		// Peek at source type to dispatch to the right builder.
-		var hint sourceTypeHint
-		if err := entry.Source.Decode(&hint); err != nil {
-			return nil, fmt.Errorf("secrets[%d]: parsing source type: %w", i, err)
-		}
-		if hint.Type == "" {
-			return nil, fmt.Errorf("secrets[%d]: source.type is required", i)
-		}
-
-		builder, ok := registry[hint.Type]
-		if !ok {
-			return nil, fmt.Errorf("secrets[%d]: unsupported source type %q", i, hint.Type)
-		}
-
-		source, err := builder.Build(entry.Source)
+		source, err := resolveSource(registry, entry.Source)
 		if err != nil {
 			return nil, fmt.Errorf("secrets[%d]: %w", i, err)
 		}
