@@ -362,10 +362,10 @@ transforms:
 ### Body capture
 
 Records the decoded request body of matching requests and surfaces it on the
-audit log record as top-level `request_body` and `request_body_truncated`
-fields. Useful for auditing the payloads passing through the proxy, such as the
-prompts a sandbox sends to an LLM provider, without modifying the upstream
-traffic.
+audit log record in a `body_capture` group holding `request_body` and
+`request_body_truncated`. Useful for auditing the payloads passing through the
+proxy, such as the prompts a sandbox sends to an LLM provider, without
+modifying the upstream traffic.
 
 Hosts, methods, and paths are matched with the same `rules` syntax as
 `allowlist` and `secrets`. `max_request_body_bytes` caps how much of each body
@@ -374,6 +374,10 @@ is captured; bodies larger than the cap are truncated to the prefix and
 independent of the global `proxy.max_request_body_bytes` limit. This transform
 is observation-only: it never rejects a request, and body read errors are
 annotated on the trace rather than failing the request.
+
+On a successful capture, the transform's entry in `request_transforms` is
+annotated with `captured_bytes` and `truncated` so the trace records that a
+body was captured without duplicating the body itself.
 
 Response bodies are not captured. Streaming responses (SSE) would have to be
 buffered end-to-end before forwarding, which would stall the client.

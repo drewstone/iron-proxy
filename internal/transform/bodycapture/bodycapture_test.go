@@ -56,6 +56,12 @@ func TestBodyCapture_MatchedRequest_PopulatesTctx(t *testing.T) {
 	require.NotNil(t, tctx.BodyCapture, "BodyCapture should be populated when a rule matches")
 	require.Equal(t, body, tctx.BodyCapture.RequestBody())
 	require.False(t, tctx.BodyCapture.RequestBodyTruncated())
+
+	// The transform also annotates its own trace entry so request_transforms
+	// self-documents the capture without duplicating the body.
+	ann := tctx.DrainAnnotations()
+	require.Equal(t, len(body), ann["captured_bytes"])
+	require.Equal(t, false, ann["truncated"])
 }
 
 func TestBodyCapture_NoMatch_DoesNotPopulateTctx(t *testing.T) {
@@ -70,6 +76,7 @@ func TestBodyCapture_NoMatch_DoesNotPopulateTctx(t *testing.T) {
 	require.Equal(t, transform.ActionContinue, res.Action)
 
 	require.Nil(t, tctx.BodyCapture, "BodyCapture should be nil when no rule matches")
+	require.Nil(t, tctx.DrainAnnotations(), "no trace annotations when no rule matches")
 }
 
 func TestBodyCapture_BodyExceedsCap_TruncatesWithFlag(t *testing.T) {
@@ -89,6 +96,10 @@ func TestBodyCapture_BodyExceedsCap_TruncatesWithFlag(t *testing.T) {
 	require.Equal(t, cap, len(tctx.BodyCapture.RequestBody()), "captured body should be exactly cap bytes")
 	require.Equal(t, strings.Repeat("x", cap), tctx.BodyCapture.RequestBody())
 	require.True(t, tctx.BodyCapture.RequestBodyTruncated(), "truncated flag should be set")
+
+	ann := tctx.DrainAnnotations()
+	require.Equal(t, cap, ann["captured_bytes"], "captured_bytes reflects the truncated length")
+	require.Equal(t, true, ann["truncated"])
 }
 
 func TestBodyCapture_Truncation_TrimsPartialUTF8Rune(t *testing.T) {
@@ -130,6 +141,7 @@ func TestBodyCapture_EmptyBody_DoesNotPopulateTctx(t *testing.T) {
 	require.Equal(t, transform.ActionContinue, res.Action)
 
 	require.Nil(t, tctx.BodyCapture, "empty body should not populate BodyCapture")
+	require.Nil(t, tctx.DrainAnnotations(), "empty body should not annotate the trace")
 }
 
 func TestBodyCapture_MultipleRules_FirstMatchCapturesOnce(t *testing.T) {

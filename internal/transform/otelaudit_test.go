@@ -213,7 +213,7 @@ func TestOTELAuditFunc_ErroredRequest(t *testing.T) {
 	assert.Equal(t, "connection reset", attrs["error"].AsString())
 }
 
-func TestOTELAuditFunc_BodyCapture_PopulatesTopLevelFields(t *testing.T) {
+func TestOTELAuditFunc_BodyCapture_PopulatesGroup(t *testing.T) {
 	proc := &recordProcessor{}
 	provider := sdklog.NewLoggerProvider(sdklog.WithProcessor(proc))
 	auditFunc := NewOTELAuditFunc(provider)
@@ -233,10 +233,12 @@ func TestOTELAuditFunc_BodyCapture_PopulatesTopLevelFields(t *testing.T) {
 	require.Len(t, records, 1)
 
 	attrs := recordAttrs(records[0])
-	require.Contains(t, attrs, "request_body")
-	assert.Equal(t, `{"prompt":"hi"}`, attrs["request_body"].AsString())
-	require.Contains(t, attrs, "request_body_truncated")
-	assert.Equal(t, false, attrs["request_body_truncated"].AsBool())
+	require.Contains(t, attrs, "body_capture")
+	bc := mapFromValue(attrs["body_capture"])
+	require.Contains(t, bc, "request_body")
+	require.Equal(t, `{"prompt":"hi"}`, bc["request_body"].AsString())
+	require.Contains(t, bc, "request_body_truncated")
+	require.Equal(t, false, bc["request_body_truncated"].AsBool())
 }
 
 func TestOTELAuditFunc_BodyCapture_TruncationFlagPropagates(t *testing.T) {
@@ -259,11 +261,13 @@ func TestOTELAuditFunc_BodyCapture_TruncationFlagPropagates(t *testing.T) {
 	require.Len(t, records, 1)
 
 	attrs := recordAttrs(records[0])
-	require.Contains(t, attrs, "request_body_truncated")
-	assert.True(t, attrs["request_body_truncated"].AsBool())
+	require.Contains(t, attrs, "body_capture")
+	bc := mapFromValue(attrs["body_capture"])
+	require.Contains(t, bc, "request_body_truncated")
+	require.True(t, bc["request_body_truncated"].AsBool())
 }
 
-func TestOTELAuditFunc_BodyCapture_NilOmitsFields(t *testing.T) {
+func TestOTELAuditFunc_BodyCapture_NilOmitsGroup(t *testing.T) {
 	proc := &recordProcessor{}
 	provider := sdklog.NewLoggerProvider(sdklog.WithProcessor(proc))
 	auditFunc := NewOTELAuditFunc(provider)
@@ -283,8 +287,7 @@ func TestOTELAuditFunc_BodyCapture_NilOmitsFields(t *testing.T) {
 	require.Len(t, records, 1)
 
 	attrs := recordAttrs(records[0])
-	assert.NotContains(t, attrs, "request_body")
-	assert.NotContains(t, attrs, "request_body_truncated")
+	require.NotContains(t, attrs, "body_capture")
 }
 
 func TestChainAuditFuncs(t *testing.T) {
