@@ -375,6 +375,10 @@ independent of the global `proxy.max_request_body_bytes` limit. This transform
 is observation-only: it never rejects a request, and body read errors are
 annotated on the trace rather than failing the request.
 
+On a successful capture, the transform's entry in `request_transforms` is
+annotated with `captured_bytes` and `truncated` so the trace records that a
+body was captured without duplicating the body itself.
+
 Response bodies are not captured. Streaming responses (SSE) would have to be
 buffered end-to-end before forwarding, which would stall the client.
 

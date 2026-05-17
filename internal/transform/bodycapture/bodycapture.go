@@ -70,7 +70,9 @@ func (b *bodyCapture) Name() string { return "body_capture" }
 // possibly truncated) body bytes to TransformContext.BodyCapture. The proxy
 // copies that onto PipelineResult after the pipeline returns; the audit
 // emitters render it as a `body_capture` group with `request_body` +
-// `request_body_truncated`.
+// `request_body_truncated`. On a successful capture the transform also
+// annotates its own trace entry with `captured_bytes` and `truncated` markers
+// so the request_transforms array self-documents.
 //
 // Always returns ActionContinue — body_capture is observation-only and never
 // rejects a request. Read errors are annotated for observability and swallowed
@@ -112,6 +114,12 @@ func (b *bodyCapture) TransformRequest(_ context.Context, tctx *transform.Transf
 		requestBody:          string(data),
 		requestBodyTruncated: truncated,
 	}
+	// Lightweight markers on the transform's own trace entry so the
+	// request_transforms array self-documents that a body was captured. The
+	// body itself is not duplicated here — it lives in the top-level
+	// body_capture group, which is cheaper for log consumers to query.
+	tctx.Annotate("captured_bytes", len(data))
+	tctx.Annotate("truncated", truncated)
 	return cont, nil
 }
 
