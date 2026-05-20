@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash"
@@ -92,8 +93,8 @@ func (e *tokenEntry) resolveCredentials(ctx context.Context, h hash.Hash) (map[s
 }
 
 // resolveEndpointHeaders mirrors resolveCredentials for the token-endpoint
-// header sources. Its slice of the hasher is namespaced with a NUL-bracketed
-// marker so it can't collide with credential field names.
+// header sources. A length-prefixed section marker precedes its fields so a
+// header named the same as a credential field can't collide with it.
 func (e *tokenEntry) resolveEndpointHeaders(ctx context.Context, h hash.Hash) (map[string]string, error) {
 	if len(e.endpointHeaderSources) == 0 {
 		return nil, nil
@@ -105,9 +106,7 @@ func (e *tokenEntry) resolveEndpointHeaders(ctx context.Context, h hash.Hash) (m
 	sort.Strings(keys)
 
 	out := make(map[string]string, len(e.endpointHeaderSources))
-	_, _ = h.Write([]byte{0})
-	_, _ = h.Write([]byte("endpoint_headers"))
-	_, _ = h.Write([]byte{0})
+	writeFingerprintBytes(h, []byte("endpoint_headers"))
 	for _, k := range keys {
 		v, err := e.endpointHeaderSources[k].Get(ctx)
 		if err != nil {
@@ -119,14 +118,20 @@ func (e *tokenEntry) resolveEndpointHeaders(ctx context.Context, h hash.Hash) (m
 	return out, nil
 }
 
-// writeFingerprintField streams a key/value pair into the hasher using the
-// same NUL-terminated `key=value\0` framing the previous string-builder
-// fingerprint used. hash.Hash writes never fail, so the errors are dropped.
+// writeFingerprintField streams a key/value pair into the hasher with explicit
+// uint32 length prefixes. Length prefixing rules out canonicalization
+// collisions regardless of what bytes a secret source returns. hash.Hash
+// writes never fail, so the errors are dropped.
 func writeFingerprintField(h hash.Hash, k, v string) {
-	_, _ = h.Write([]byte(k))
-	_, _ = h.Write([]byte{'='})
-	_, _ = h.Write([]byte(v))
-	_, _ = h.Write([]byte{0})
+	writeFingerprintBytes(h, []byte(k))
+	writeFingerprintBytes(h, []byte(v))
+}
+
+func writeFingerprintBytes(h hash.Hash, b []byte) {
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(b)))
+	_, _ = h.Write(lenBuf[:])
+	_, _ = h.Write(b)
 }
 
 // headerInjectingTransport sets configured headers on every request before
