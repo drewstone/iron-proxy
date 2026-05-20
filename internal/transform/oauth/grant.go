@@ -2,13 +2,15 @@ package oauth
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"log/slog"
 	"net/http"
 	"sort"
-	"strings"
 
+	"github.com/zeebo/blake3"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
 )
@@ -34,16 +36,20 @@ func (e *tokenEntry) mint(ctx context.Context) (string, error) {
 // caches the access token and single-flights concurrent refreshes.
 func (e *tokenEntry) tokenSourceFor(ctx context.Context) (oauth2.TokenSource, error) {
 	// Sources are read outside the lock: each has its own ttl cache, so this is
-	// cheap and returns stable values within the ttl window.
-	vals, fingerprint, err := e.resolveCredentials(ctx)
+	// cheap and returns stable values within the ttl window. Credential bytes
+	// stream straight into the hasher so plaintext secrets aren't held in an
+	// intermediate buffer.
+	h := blake3.New()
+	vals, err := e.resolveCredentials(ctx, h)
 	if err != nil {
 		return nil, err
 	}
-	headers, headerFingerprint, err := e.resolveEndpointHeaders(ctx)
+	headers, err := e.resolveEndpointHeaders(ctx, h)
 	if err != nil {
 		return nil, err
 	}
-	fingerprint += headerFingerprint
+	var fingerprint [32]byte
+	copy(fingerprint[:], h.Sum(nil))
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -63,10 +69,11 @@ func (e *tokenEntry) tokenSourceFor(ctx context.Context) (oauth2.TokenSource, er
 	return ts, nil
 }
 
-// resolveCredentials fetches every credential source for the entry and returns
-// the resolved values keyed by field, plus a fingerprint that changes whenever
+// resolveCredentials fetches every credential source for the entry, returns
+// the resolved values keyed by field, and streams each key/value pair into the
+// given hasher so the caller can derive a fingerprint that changes whenever
 // any value does.
-func (e *tokenEntry) resolveCredentials(ctx context.Context) (map[string]string, string, error) {
+func (e *tokenEntry) resolveCredentials(ctx context.Context, h hash.Hash) (map[string]string, error) {
 	keys := make([]string, 0, len(e.sources))
 	for k := range e.sources {
 		keys = append(keys, k)
@@ -74,27 +81,23 @@ func (e *tokenEntry) resolveCredentials(ctx context.Context) (map[string]string,
 	sort.Strings(keys)
 
 	vals := make(map[string]string, len(e.sources))
-	var fp strings.Builder
 	for _, k := range keys {
 		v, err := e.sources[k].Get(ctx)
 		if err != nil {
-			return nil, "", fmt.Errorf("loading %s from %q: %w", k, e.sources[k].Name(), err)
+			return nil, fmt.Errorf("loading %s from %q: %w", k, e.sources[k].Name(), err)
 		}
 		vals[k] = v
-		fp.WriteString(k)
-		fp.WriteByte('=')
-		fp.WriteString(v)
-		fp.WriteByte(0)
+		writeFingerprintField(h, k, v)
 	}
-	return vals, fp.String(), nil
+	return vals, nil
 }
 
 // resolveEndpointHeaders mirrors resolveCredentials for the token-endpoint
-// header sources. The returned fingerprint slot is namespaced with a NUL so it
-// can't collide with credential field names.
-func (e *tokenEntry) resolveEndpointHeaders(ctx context.Context) (map[string]string, string, error) {
+// header sources. A length-prefixed section marker precedes its fields so a
+// header named the same as a credential field can't collide with it.
+func (e *tokenEntry) resolveEndpointHeaders(ctx context.Context, h hash.Hash) (map[string]string, error) {
 	if len(e.endpointHeaderSources) == 0 {
-		return nil, "", nil
+		return nil, nil
 	}
 	keys := make([]string, 0, len(e.endpointHeaderSources))
 	for k := range e.endpointHeaderSources {
@@ -103,22 +106,32 @@ func (e *tokenEntry) resolveEndpointHeaders(ctx context.Context) (map[string]str
 	sort.Strings(keys)
 
 	out := make(map[string]string, len(e.endpointHeaderSources))
-	var fp strings.Builder
-	fp.WriteByte(0)
-	fp.WriteString("endpoint_headers")
-	fp.WriteByte(0)
+	writeFingerprintBytes(h, []byte("endpoint_headers"))
 	for _, k := range keys {
 		v, err := e.endpointHeaderSources[k].Get(ctx)
 		if err != nil {
-			return nil, "", fmt.Errorf("loading token_endpoint_headers[%q] from %q: %w", k, e.endpointHeaderSources[k].Name(), err)
+			return nil, fmt.Errorf("loading token_endpoint_headers[%q] from %q: %w", k, e.endpointHeaderSources[k].Name(), err)
 		}
 		out[k] = v
-		fp.WriteString(k)
-		fp.WriteByte('=')
-		fp.WriteString(v)
-		fp.WriteByte(0)
+		writeFingerprintField(h, k, v)
 	}
-	return out, fp.String(), nil
+	return out, nil
+}
+
+// writeFingerprintField streams a key/value pair into the hasher with explicit
+// uint32 length prefixes. Length prefixing rules out canonicalization
+// collisions regardless of what bytes a secret source returns. hash.Hash
+// writes never fail, so the errors are dropped.
+func writeFingerprintField(h hash.Hash, k, v string) {
+	writeFingerprintBytes(h, []byte(k))
+	writeFingerprintBytes(h, []byte(v))
+}
+
+func writeFingerprintBytes(h hash.Hash, b []byte) {
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(b)))
+	_, _ = h.Write(lenBuf[:])
+	_, _ = h.Write(b)
 }
 
 // headerInjectingTransport sets configured headers on every request before

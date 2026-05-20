@@ -127,9 +127,10 @@ type tokenEntry struct {
 	// mu guards the lazily built token source and the fingerprint of the
 	// credential values it was built from. The token source is rebuilt when
 	// any source value changes (e.g. a credential's ttl expired and the secret
-	// store returned a new value).
+	// store returned a new value). The fingerprint is a BLAKE3 digest of the
+	// resolved values, so plaintext secrets aren't retained on the entry.
 	mu          sync.Mutex
-	fingerprint string
+	fingerprint [32]byte
 	tokenSource oauth2.TokenSource
 }
 
