@@ -287,9 +287,12 @@ transforms:
   #   password            RFC 6749 4.3 — username + password + client id
   #                       (+ optional client secret). Used by vendors that
   #                       trade a service-account login for a bearer.
+  #   jwt_bearer          RFC 7523 — a JWT signed with an RSA private key,
+  #                       posted as an assertion. Used by DocuSign,
+  #                       Salesforce, Box, Zoom Server-to-Server, etc.
   #
-  # (For GCP service-account auth — the RFC 7523 JWT-bearer grant — use the
-  # gcp_auth transform above instead.)
+  # (For GCP service-account auth — also an RFC 7523 JWT-bearer flow but with
+  # a Google-specific keyfile format — use the gcp_auth transform above.)
   #
   # Each credential field is a discrete secret source, the same shape as a
   # secrets transform source (env, aws_sm, aws_ssm, 1password,
@@ -336,6 +339,29 @@ transforms:
   #         token_endpoint: "https://login.example.com/oauth2/token"
   #         rules:
   #           - host: "api.example.com"
+  #
+  # DocuSign-style: JWT-bearer grant. The proxy mints a JWT signed with the
+  # integration's RSA private key, exchanges it at the token endpoint, and
+  # injects the resulting bearer on requests to DocuSign's API hosts.
+  # The same shape works for Salesforce (audience=https://login.salesforce.com,
+  # token_endpoint=https://login.salesforce.com/services/oauth2/token), Box,
+  # Zoom Server-to-Server, etc. — only audience, token_endpoint, and scopes
+  # change.
+  # - name: oauth_token
+  #   config:
+  #     tokens:
+  #       - grant: jwt_bearer
+  #         issuer:         {type: env, var: DOCUSIGN_INTEGRATION_KEY}   # iss
+  #         subject:        {type: env, var: DOCUSIGN_USER_GUID}         # sub
+  #         private_key:                                                 # PEM-encoded RSA private key
+  #           type: 1password_connect
+  #           secret_ref: "op://Engineering/DOCUSIGN/private-key.pem"
+  #         private_key_id: {type: env, var: DOCUSIGN_KEY_ID}            # optional; emitted as JWT kid header
+  #         audience: "account.docusign.com"                             # account-d.docusign.com for the dev sandbox
+  #         token_endpoint: "https://account.docusign.com/oauth/token"
+  #         scopes: ["signature", "impersonation"]
+  #         rules:
+  #           - host: "*.docusign.net"
   #
   # AlphaSense-style: password grant + an api-key header on both the token
   # endpoint and the resource endpoint. The bearer is minted here; the static

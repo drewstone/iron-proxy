@@ -2,20 +2,22 @@
 // injects them as Authorization: Bearer headers on matching requests.
 //
 // One oauth_token transform carries a list of token entries. Each entry names
-// an OAuth2 grant (refresh_token, client_credentials, or password), the
-// credential fields it needs — each resolved from any secrets-package source
-// (env, 1password, 1password_connect, aws_sm, aws_ssm) — and host rules
-// selecting the requests it applies to. Token exchange, caching, refresh, and
-// single-flight are delegated to golang.org/x/oauth2 — the same code path the
-// official SDKs use.
+// an OAuth2 grant (refresh_token, client_credentials, password, or
+// jwt_bearer), the credential fields it needs — each resolved from any
+// secrets-package source (env, 1password, 1password_connect, aws_sm, aws_ssm)
+// — and host rules selecting the requests it applies to. Token exchange,
+// caching, refresh, and single-flight are delegated to golang.org/x/oauth2 —
+// the same code path the official SDKs use.
 //
 // Entries may also declare token_endpoint_headers: a map of header name to
 // secret source whose resolved values are sent on the token POST itself. Some
 // vendors require an api-key header on the token endpoint in addition to the
 // standard client_id / client_secret form fields.
 //
-// GCP service-account auth (the RFC 7523 JWT-bearer grant against a Google
-// keyfile) is handled by the separate gcp_auth transform.
+// The jwt_bearer grant (RFC 7523) covers vendors that authenticate with a
+// signed JWT assertion — DocuSign, Salesforce, Box, Zoom Server-to-Server,
+// etc. GCP service-account auth uses the same flow but has a vendor-specific
+// keyfile format and is handled by the separate gcp_auth transform.
 //
 // Like all header-injecting transforms, this requires MITM mode; sni-only
 // mode has no way to rewrite headers.
@@ -41,6 +43,7 @@ const (
 	grantRefreshToken      = "refresh_token"
 	grantClientCredentials = "client_credentials"
 	grantPassword          = "password"
+	grantJWTBearer         = "jwt_bearer"
 )
 
 // Credential field keys. They name both a config field and the corresponding
@@ -52,6 +55,10 @@ const (
 	fieldClientSecret = "client_secret"
 	fieldUsername     = "username"
 	fieldPassword     = "password"
+	fieldIssuer       = "issuer"
+	fieldSubject      = "subject"
+	fieldPrivateKey   = "private_key"
+	fieldPrivateKeyID = "private_key_id"
 )
 
 // stubAccessToken is the placeholder bearer returned to clients that fetch a
@@ -78,11 +85,22 @@ type tokenEntryConfig struct {
 	// the fields can live in different stores or be pulled out of one JSON
 	// secret with json_key. ClientSecret is optional for public refresh_token
 	// clients. Username and Password are only used by the password grant.
+	// Issuer/Subject/PrivateKey/PrivateKeyID are only used by the jwt_bearer
+	// grant.
 	RefreshToken yaml.Node `yaml:"refresh_token"`
 	ClientID     yaml.Node `yaml:"client_id"`
 	ClientSecret yaml.Node `yaml:"client_secret"`
 	Username     yaml.Node `yaml:"username"`
 	Password     yaml.Node `yaml:"password"`
+	Issuer       yaml.Node `yaml:"issuer"`
+	Subject      yaml.Node `yaml:"subject"`
+	PrivateKey   yaml.Node `yaml:"private_key"`
+	PrivateKeyID yaml.Node `yaml:"private_key_id"`
+
+	// Audience is the JWT "aud" claim for the jwt_bearer grant. It is a plain
+	// string because it is a per-provider constant (e.g. "account.docusign.com",
+	// "https://login.salesforce.com") and never rotated.
+	Audience string `yaml:"audience,omitempty"`
 
 	TokenEndpoint string                 `yaml:"token_endpoint,omitempty"`
 	Scopes        []string               `yaml:"scopes,omitempty"`
@@ -115,6 +133,7 @@ type tokenEntry struct {
 	header      string
 	valuePrefix string
 	cfgEndpoint string // config token_endpoint
+	audience    string // JWT "aud" claim, jwt_bearer grant only
 	logger      *slog.Logger
 
 	// sources holds the entry's credential secret sources, keyed by field.
@@ -173,12 +192,15 @@ func isSet(n yaml.Node) bool { return n.Kind != 0 }
 
 func buildEntry(tc tokenEntryConfig, logger *slog.Logger, buildSource sourceBuilder) (*tokenEntry, *tokenEndpoint, error) {
 	switch tc.Grant {
-	case grantRefreshToken, grantClientCredentials, grantPassword:
+	case grantRefreshToken, grantClientCredentials, grantPassword, grantJWTBearer:
 	default:
-		return nil, nil, fmt.Errorf("\"grant\" must be one of refresh_token, client_credentials, password (got %q)", tc.Grant)
+		return nil, nil, fmt.Errorf("\"grant\" must be one of refresh_token, client_credentials, password, jwt_bearer (got %q)", tc.Grant)
 	}
 	if tc.TokenEndpoint == "" {
 		return nil, nil, fmt.Errorf("%s grant requires \"token_endpoint\"", tc.Grant)
+	}
+	if tc.Grant == grantJWTBearer && tc.Audience == "" {
+		return nil, nil, fmt.Errorf("jwt_bearer grant requires \"audience\"")
 	}
 
 	sources, err := buildCredentialSources(tc, logger, buildSource)
@@ -223,6 +245,7 @@ func buildEntry(tc tokenEntryConfig, logger *slog.Logger, buildSource sourceBuil
 		header:                header,
 		valuePrefix:           valuePrefix,
 		cfgEndpoint:           tc.TokenEndpoint,
+		audience:              tc.Audience,
 		sources:               sources,
 		endpointHeaderSources: endpointHeaders,
 		logger:                logger,
@@ -291,6 +314,26 @@ func buildCredentialSources(tc tokenEntryConfig, logger *slog.Logger, buildSourc
 		}
 		if isSet(tc.ClientSecret) {
 			fields[fieldClientSecret] = tc.ClientSecret
+		}
+		return buildAll(fields)
+
+	case grantJWTBearer:
+		if !isSet(tc.Issuer) {
+			return nil, fmt.Errorf("jwt_bearer grant requires \"issuer\"")
+		}
+		if !isSet(tc.Subject) {
+			return nil, fmt.Errorf("jwt_bearer grant requires \"subject\"")
+		}
+		if !isSet(tc.PrivateKey) {
+			return nil, fmt.Errorf("jwt_bearer grant requires \"private_key\"")
+		}
+		fields := map[string]yaml.Node{
+			fieldIssuer:     tc.Issuer,
+			fieldSubject:    tc.Subject,
+			fieldPrivateKey: tc.PrivateKey,
+		}
+		if isSet(tc.PrivateKeyID) {
+			fields[fieldPrivateKeyID] = tc.PrivateKeyID
 		}
 		return buildAll(fields)
 	}
