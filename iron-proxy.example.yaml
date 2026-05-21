@@ -435,6 +435,42 @@ transforms:
   #     rules:
   #       - host: "api.falconx.io"
 
+  # AWS SigV4 signing: attaches an AWS Signature Version 4 Authorization header
+  # to outbound requests. Credentials are pulled from any registered secret
+  # source (env, aws_sm, aws_ssm, 1password, ...). Use one entry per
+  # region/service/credential combination and gate each with rules.
+  #
+  # Requires MITM mode. Bodies shorter than Content-Length → 413, chunked
+  # bodies → 400 unless allow_chunked_body: true. For streaming uploads or any
+  # case where the body must not be buffered (S3 multipart, etc.) set
+  # unsigned_payload: true.
+  #
+  # Example: Bedrock model invocation
+  # - name: awssigv4
+  #   config:
+  #     region: us-east-1
+  #     service: bedrock
+  #     access_key_id:     {type: env, var: AWS_ACCESS_KEY_ID}
+  #     secret_access_key: {type: env, var: AWS_SECRET_ACCESS_KEY}
+  #     # session_token:   {type: env, var: AWS_SESSION_TOKEN}  # optional, for STS / role creds
+  #     # unsigned_payload: false
+  #     # allow_chunked_body: false
+  #     rules:
+  #       - host: "bedrock-runtime.us-east-1.amazonaws.com"
+  #         methods: ["POST"]
+  #         paths: ["/model/*"]
+  #
+  # Example: S3 in eu-west-1 (streaming uploads)
+  # - name: awssigv4
+  #   config:
+  #     region: eu-west-1
+  #     service: s3
+  #     access_key_id:     {type: env, var: AWS_ACCESS_KEY_ID}
+  #     secret_access_key: {type: env, var: AWS_SECRET_ACCESS_KEY}
+  #     unsigned_payload: true
+  #     rules:
+  #       - host: "*.s3.eu-west-1.amazonaws.com"
+
   # Header allowlist: strips any request header not listed below before the
   # request goes upstream. Default-deny — every header must either match a
   # literal name (case-insensitive) or a /regex/ pattern. Place this AFTER
