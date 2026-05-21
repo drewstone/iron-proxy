@@ -13,6 +13,7 @@ import (
 	"github.com/zeebo/blake3"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
+	"golang.org/x/oauth2/jwt"
 )
 
 // mint returns a cached or freshly minted access token for the entry.
@@ -60,7 +61,7 @@ func (e *tokenEntry) tokenSourceFor(ctx context.Context) (oauth2.TokenSource, er
 	if len(headers) > 0 {
 		tsCtx = context.WithValue(ctx, oauth2.HTTPClient, newHeaderInjectingClient(headers))
 	}
-	ts, err := buildTokenSource(tsCtx, e.grant, vals, e.scopes, e.cfgEndpoint)
+	ts, err := buildTokenSource(tsCtx, e.grant, vals, e.scopes, e.cfgEndpoint, e.audience)
 	if err != nil {
 		return nil, err
 	}
@@ -161,8 +162,9 @@ func newHeaderInjectingClient(headers map[string]string) *http.Client {
 
 // buildTokenSource constructs an oauth2.TokenSource for one grant from its
 // resolved credential values. It performs no I/O: the token is exchanged
-// lazily on the first Token() call.
-func buildTokenSource(ctx context.Context, grant string, vals map[string]string, scopes []string, cfgEndpoint string) (oauth2.TokenSource, error) {
+// lazily on the first Token() call. audience is only consulted by the
+// jwt_bearer grant.
+func buildTokenSource(ctx context.Context, grant string, vals map[string]string, scopes []string, cfgEndpoint, audience string) (oauth2.TokenSource, error) {
 	switch grant {
 	case grantRefreshToken:
 		return refreshTokenTokenSource(ctx, vals, scopes, cfgEndpoint)
@@ -170,9 +172,49 @@ func buildTokenSource(ctx context.Context, grant string, vals map[string]string,
 		return clientCredentialsTokenSource(ctx, vals, scopes, cfgEndpoint)
 	case grantPassword:
 		return passwordTokenSource(ctx, vals, scopes, cfgEndpoint)
+	case grantJWTBearer:
+		return jwtBearerTokenSource(ctx, vals, scopes, cfgEndpoint, audience)
 	default:
 		return nil, fmt.Errorf("unknown grant %q", grant)
 	}
+}
+
+// jwtBearerTokenSource builds a token source for the RFC 7523 JWT-bearer grant.
+// The proxy mints a JWT signed with an RSA private key (PEM bytes from the
+// secret source) and POSTs it as the OAuth2 assertion. Covers DocuSign,
+// Salesforce, Box, Zoom Server-to-Server, etc. — the audience and token
+// endpoint distinguish providers.
+func jwtBearerTokenSource(ctx context.Context, vals map[string]string, scopes []string, cfgEndpoint, audience string) (oauth2.TokenSource, error) {
+	issuer := vals[fieldIssuer]
+	subject := vals[fieldSubject]
+	privateKey := vals[fieldPrivateKey]
+	privateKeyID := vals[fieldPrivateKeyID] // optional
+	if issuer == "" {
+		return nil, fmt.Errorf("jwt_bearer grant is missing the issuer")
+	}
+	if subject == "" {
+		return nil, fmt.Errorf("jwt_bearer grant is missing the subject")
+	}
+	if privateKey == "" {
+		return nil, fmt.Errorf("jwt_bearer grant is missing the private key")
+	}
+	if cfgEndpoint == "" {
+		return nil, fmt.Errorf("jwt_bearer grant needs a token endpoint: set \"token_endpoint\"")
+	}
+	if audience == "" {
+		return nil, fmt.Errorf("jwt_bearer grant needs an audience: set \"audience\"")
+	}
+
+	cfg := &jwt.Config{
+		Email:        issuer,
+		Subject:      subject,
+		PrivateKey:   []byte(privateKey),
+		PrivateKeyID: privateKeyID,
+		Audience:     audience,
+		Scopes:       scopes,
+		TokenURL:     cfgEndpoint,
+	}
+	return cfg.TokenSource(ctx), nil
 }
 
 // refreshTokenTokenSource builds a token source for the RFC 6749 refresh_token

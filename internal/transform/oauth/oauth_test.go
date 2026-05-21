@@ -2,13 +2,21 @@ package oauth
 
 import (
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -189,7 +197,7 @@ func TestValidation(t *testing.T) {
 			name: "unknown grant",
 			yaml: `
 tokens:
-  - grant: jwt_bearer
+  - grant: magic_beans
     client_id: {type: env, var: CID}
     rules:
       - host: "example.com"
@@ -292,6 +300,76 @@ tokens:
       - host: "example.com"
 `,
 			wantError: "password grant requires \"client_id\"",
+		},
+		{
+			name: "jwt_bearer missing audience",
+			yaml: `
+tokens:
+  - grant: jwt_bearer
+    issuer:      {type: env, var: ISS}
+    subject:     {type: env, var: SUB}
+    private_key: {type: env, var: PK}
+    token_endpoint: "https://t.example.com/token"
+    rules:
+      - host: "example.com"
+`,
+			wantError: "jwt_bearer grant requires \"audience\"",
+		},
+		{
+			name: "jwt_bearer missing issuer",
+			yaml: `
+tokens:
+  - grant: jwt_bearer
+    subject:     {type: env, var: SUB}
+    private_key: {type: env, var: PK}
+    audience: "aud.example.com"
+    token_endpoint: "https://t.example.com/token"
+    rules:
+      - host: "example.com"
+`,
+			wantError: "jwt_bearer grant requires \"issuer\"",
+		},
+		{
+			name: "jwt_bearer missing subject",
+			yaml: `
+tokens:
+  - grant: jwt_bearer
+    issuer:      {type: env, var: ISS}
+    private_key: {type: env, var: PK}
+    audience: "aud.example.com"
+    token_endpoint: "https://t.example.com/token"
+    rules:
+      - host: "example.com"
+`,
+			wantError: "jwt_bearer grant requires \"subject\"",
+		},
+		{
+			name: "jwt_bearer missing private_key",
+			yaml: `
+tokens:
+  - grant: jwt_bearer
+    issuer:  {type: env, var: ISS}
+    subject: {type: env, var: SUB}
+    audience: "aud.example.com"
+    token_endpoint: "https://t.example.com/token"
+    rules:
+      - host: "example.com"
+`,
+			wantError: "jwt_bearer grant requires \"private_key\"",
+		},
+		{
+			name: "jwt_bearer missing token_endpoint",
+			yaml: `
+tokens:
+  - grant: jwt_bearer
+    issuer:      {type: env, var: ISS}
+    subject:     {type: env, var: SUB}
+    private_key: {type: env, var: PK}
+    audience: "aud.example.com"
+    rules:
+      - host: "example.com"
+`,
+			wantError: "jwt_bearer grant requires \"token_endpoint\"",
 		},
 	}
 	for _, tc := range cases {
@@ -745,6 +823,191 @@ tokens:
 	_, err := o.TransformRequest(context.Background(), newContext(), req)
 	require.NoError(t, err)
 	require.Equal(t, "acme", srv.LastHeaders().Get("X-Tenant"))
+}
+
+// --- jwt_bearer grant ---
+
+// pemRSAKey generates an RSA private key and returns it both as a *rsa.PrivateKey
+// (for verifying the signature in the test) and as PEM bytes (to feed into the
+// transform as the private_key secret value).
+func pemRSAKey(t *testing.T) (*rsa.PrivateKey, string) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	pemBlock := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}
+	return key, string(pem.EncodeToMemory(pemBlock))
+}
+
+// parseAssertion splits a compact-serialized JWS into decoded header and claim
+// maps plus the signing input and signature bytes — enough to verify both the
+// claim shape and the RS256 signature without pulling in a JWT library.
+func parseAssertion(t *testing.T, assertion string) (header, claims map[string]any, signingInput []byte, sig []byte) {
+	t.Helper()
+	parts := strings.Split(assertion, ".")
+	require.Len(t, parts, 3, "assertion must have three dot-separated segments")
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	require.NoError(t, err)
+	claimsBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	require.NoError(t, err)
+	sig, err = base64.RawURLEncoding.DecodeString(parts[2])
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(headerBytes, &header))
+	require.NoError(t, json.Unmarshal(claimsBytes, &claims))
+	signingInput = []byte(parts[0] + "." + parts[1])
+	return header, claims, signingInput, sig
+}
+
+func TestJWTBearerGrant_InjectsBearer(t *testing.T) {
+	key, pemKey := pemRSAKey(t)
+
+	var observedAssertion string
+	srv := newTokenServer(t, func(form url.Values) (int, map[string]any) {
+		observedAssertion = form.Get("assertion")
+		return http.StatusOK, map[string]any{
+			"access_token": "minted-token",
+			"token_type":   "Bearer",
+			"expires_in":   3600,
+		}
+	})
+
+	o := buildTransformWith(t, `
+tokens:
+  - grant: jwt_bearer
+    issuer:         {type: env, var: ISS}
+    subject:        {type: env, var: SUB}
+    private_key:    {type: env, var: PK}
+    private_key_id: {type: env, var: KID}
+    audience: "account.docusign.com"
+    token_endpoint: "`+srv.URL+`/token"
+    scopes: ["signature", "impersonation"]
+    rules:
+      - host: "*.docusign.net"
+`, mapBuilder(map[string]secrets.Source{
+		"ISS": &staticSource{name: "iss", value: "integration-key"},
+		"SUB": &staticSource{name: "sub", value: "user-guid"},
+		"PK":  &staticSource{name: "pk", value: pemKey},
+		"KID": &staticSource{name: "kid", value: "key-1"},
+	}))
+
+	req := newRequest(t, http.MethodGet, "https://demo.docusign.net/restapi/v2.1/accounts/x/users")
+	res, err := o.TransformRequest(context.Background(), newContext(), req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionContinue, res.Action)
+	require.Equal(t, "Bearer minted-token", req.Header.Get("Authorization"))
+
+	form := srv.LastForm()
+	require.Equal(t, "urn:ietf:params:oauth:grant-type:jwt-bearer", form.Get("grant_type"))
+	require.NotEmpty(t, observedAssertion)
+
+	header, claims, signingInput, sig := parseAssertion(t, observedAssertion)
+	require.Equal(t, "RS256", header["alg"])
+	require.Equal(t, "JWT", header["typ"])
+	require.Equal(t, "key-1", header["kid"])
+	require.Equal(t, "integration-key", claims["iss"])
+	require.Equal(t, "user-guid", claims["sub"])
+	require.Equal(t, "account.docusign.com", claims["aud"])
+	require.Equal(t, "signature impersonation", claims["scope"])
+	require.NotZero(t, claims["iat"])
+	require.NotZero(t, claims["exp"])
+
+	digest := sha256.Sum256(signingInput)
+	require.NoError(t, rsa.VerifyPKCS1v15(&key.PublicKey, crypto.SHA256, digest[:], sig),
+		"assertion signature must verify against the registered public key")
+}
+
+// A jwt_bearer entry without a private_key_id omits the JWT kid header.
+func TestJWTBearerGrant_NoKeyID(t *testing.T) {
+	_, pemKey := pemRSAKey(t)
+
+	var observedAssertion string
+	srv := newTokenServer(t, func(form url.Values) (int, map[string]any) {
+		observedAssertion = form.Get("assertion")
+		return http.StatusOK, map[string]any{
+			"access_token": "minted-token",
+			"token_type":   "Bearer",
+			"expires_in":   3600,
+		}
+	})
+
+	o := buildTransformWith(t, `
+tokens:
+  - grant: jwt_bearer
+    issuer:      {type: env, var: ISS}
+    subject:     {type: env, var: SUB}
+    private_key: {type: env, var: PK}
+    audience: "account.docusign.com"
+    token_endpoint: "`+srv.URL+`/token"
+    rules:
+      - host: "*.docusign.net"
+`, mapBuilder(map[string]secrets.Source{
+		"ISS": &staticSource{name: "iss", value: "integration-key"},
+		"SUB": &staticSource{name: "sub", value: "user-guid"},
+		"PK":  &staticSource{name: "pk", value: pemKey},
+	}))
+
+	req := newRequest(t, http.MethodGet, "https://demo.docusign.net/restapi/v2.1/x")
+	_, err := o.TransformRequest(context.Background(), newContext(), req)
+	require.NoError(t, err)
+	header, _, _, _ := parseAssertion(t, observedAssertion)
+	_, ok := header["kid"]
+	require.False(t, ok, "kid must be omitted when private_key_id is not set")
+}
+
+// Rotating the private_key value invalidates the cached token source so the
+// next mint signs with the new key. Other credentials behave the same; this
+// guards the jwt_bearer-specific wiring through resolveCredentials.
+func TestJWTBearerGrant_KeyRotationRebuildsTokenSource(t *testing.T) {
+	keyA, pemA := pemRSAKey(t)
+	keyB, pemB := pemRSAKey(t)
+
+	var observedAssertion string
+	mintCount := 0
+	srv := newTokenServer(t, func(form url.Values) (int, map[string]any) {
+		mintCount++
+		observedAssertion = form.Get("assertion")
+		return http.StatusOK, map[string]any{
+			"access_token": fmt.Sprintf("minted-token-%d", mintCount),
+			"token_type":   "Bearer",
+			"expires_in":   3600,
+		}
+	})
+
+	pkSource := &staticSource{name: "pk", value: pemA}
+	o := buildTransformWith(t, `
+tokens:
+  - grant: jwt_bearer
+    issuer:      {type: env, var: ISS}
+    subject:     {type: env, var: SUB}
+    private_key: {type: env, var: PK}
+    audience: "account.docusign.com"
+    token_endpoint: "`+srv.URL+`/token"
+    rules:
+      - host: "*.docusign.net"
+`, mapBuilder(map[string]secrets.Source{
+		"ISS": &staticSource{name: "iss", value: "integration-key"},
+		"SUB": &staticSource{name: "sub", value: "user-guid"},
+		"PK":  pkSource,
+	}))
+
+	req := newRequest(t, http.MethodGet, "https://demo.docusign.net/v1/x")
+	_, err := o.TransformRequest(context.Background(), newContext(), req)
+	require.NoError(t, err)
+	require.Equal(t, "Bearer minted-token-1", req.Header.Get("Authorization"))
+
+	_, _, signingInput, sig := parseAssertion(t, observedAssertion)
+	digest := sha256.Sum256(signingInput)
+	require.NoError(t, rsa.VerifyPKCS1v15(&keyA.PublicKey, crypto.SHA256, digest[:], sig))
+
+	pkSource.value = pemB
+	req2 := newRequest(t, http.MethodGet, "https://demo.docusign.net/v1/y")
+	_, err = o.TransformRequest(context.Background(), newContext(), req2)
+	require.NoError(t, err)
+	require.Equal(t, "Bearer minted-token-2", req2.Header.Get("Authorization"),
+		"rotating the private key must rebuild the token source and force a remint")
+
+	_, _, signingInput, sig = parseAssertion(t, observedAssertion)
+	digest = sha256.Sum256(signingInput)
+	require.NoError(t, rsa.VerifyPKCS1v15(&keyB.PublicKey, crypto.SHA256, digest[:], sig))
 }
 
 // --- factory end-to-end through the real secrets package ---
