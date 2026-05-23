@@ -1,0 +1,37 @@
+dns:
+  proxy_ip: "127.0.0.1"
+  listen: "127.0.0.1:0"
+
+proxy:
+  http_listen: "127.0.0.1:0"
+  https_listen: "127.0.0.1:0"
+  max_request_body_bytes: 1048576
+  upstream_deny_cidrs: []
+
+tls:
+  ca_cert: tmp/ca.crt
+  ca_key: tmp/ca.key
+
+transforms:
+  - name: allowlist
+    config:
+      domains:
+        - "127.0.0.1"
+
+  - name: aws_auth
+    config:
+      # workload_identity defers to the AWS SDK default credential chain. The
+      # chain's first leg reads AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
+      # AWS_SESSION_TOKEN from the proxy's env, so this exercises the
+      # workload_identity provider end-to-end without needing real IRSA or
+      # IMDS.
+      credentials_provider:
+        type: workload_identity
+      rules:
+        - host: "127.0.0.1"
+
+metrics:
+  listen: "127.0.0.1:0"
+
+log:
+  level: info
