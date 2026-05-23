@@ -20,8 +20,6 @@ transforms:
 
   - name: aws_auth
     config:
-      region: us-east-1
-      service: bedrock
       access_key_id:     {type: env, var: AWS_ACCESS_KEY_ID}
       secret_access_key: {type: env, var: AWS_SECRET_ACCESS_KEY}
       session_token:     {type: env, var: AWS_SESSION_TOKEN}

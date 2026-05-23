@@ -435,41 +435,36 @@ transforms:
   #     rules:
   #       - host: "api.falconx.io"
 
-  # AWS auth: attaches an AWS Signature Version 4 Authorization header
-  # to outbound requests. Credentials are pulled from any registered secret
-  # source (env, aws_sm, aws_ssm, 1password, ...). Use one entry per
-  # region/service/credential combination and gate each with rules.
+  # AWS auth: re-signs an inbound SigV4 request with real credentials drawn
+  # from any registered secret source (env, aws_sm, aws_ssm, 1password, ...).
+  # The client (typically an AWS SDK) is expected to sign with placeholder
+  # credentials and any AWS_REGION/service it cares about. This transform
+  # parses the region and service out of the inbound credential scope and
+  # re-signs with the real creds, so one entry covers every AWS service the
+  # client talks to. Use allowed_regions / allowed_services to gate which
+  # scopes this entry is willing to sign for.
+  #
+  # Configure your AWS SDK with any placeholder credentials, e.g.:
+  #   AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+  #   AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+  # then point the SDK at this proxy. The real keys never leave the proxy.
   #
   # Requires MITM mode. Bodies shorter than Content-Length → 413, chunked
   # bodies → 400 unless allow_chunked_body: true. For streaming uploads or any
   # case where the body must not be buffered (S3 multipart, etc.) set
   # unsigned_payload: true.
   #
-  # Example: Bedrock model invocation
   # - name: aws_auth
   #   config:
-  #     region: us-east-1
-  #     service: bedrock
   #     access_key_id:     {type: env, var: AWS_ACCESS_KEY_ID}
   #     secret_access_key: {type: env, var: AWS_SECRET_ACCESS_KEY}
   #     # session_token:   {type: env, var: AWS_SESSION_TOKEN}  # optional, for STS / role creds
+  #     # allowed_regions:  ["us-east-1", "eu-west-1"]           # optional safety gate; default allows any region
+  #     # allowed_services: ["bedrock", "s3", "dynamodb"]        # optional safety gate; default allows any service
   #     # unsigned_payload: false
   #     # allow_chunked_body: false
   #     rules:
-  #       - host: "bedrock-runtime.us-east-1.amazonaws.com"
-  #         methods: ["POST"]
-  #         paths: ["/model/*"]
-  #
-  # Example: S3 in eu-west-1 (streaming uploads)
-  # - name: aws_auth
-  #   config:
-  #     region: eu-west-1
-  #     service: s3
-  #     access_key_id:     {type: env, var: AWS_ACCESS_KEY_ID}
-  #     secret_access_key: {type: env, var: AWS_SECRET_ACCESS_KEY}
-  #     unsigned_payload: true
-  #     rules:
-  #       - host: "*.s3.eu-west-1.amazonaws.com"
+  #       - host: "*.amazonaws.com"
 
   # Header allowlist: strips any request header not listed below before the
   # request goes upstream. Default-deny — every header must either match a

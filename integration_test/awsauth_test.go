@@ -1,6 +1,9 @@
 package integration_test
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -8,13 +11,17 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/stretchr/testify/require"
 )
 
 // TestAWSAuth boots the proxy with the aws_auth transform configured and
-// verifies that requests routed through it arrive at the upstream with a
-// valid-looking AWS Signature Version 4 Authorization header.
+// verifies that an SDK-signed request arrives at the upstream with a fresh
+// signature minted from the proxy's real credentials, not the placeholder
+// the client used.
 func TestAWSAuth(t *testing.T) {
 	tmpDir := t.TempDir()
 	binary := proxyBinary(t)
@@ -44,10 +51,25 @@ func TestAWSAuth(t *testing.T) {
 	proxy := startProxy(t, binary, cfgPath, env)
 	upstreamHost := upstream.Listener.Addr().String()
 
-	req, err := http.NewRequest("POST", fmt.Sprintf("http://%s/model/foo/invoke", proxy.HTTPAddr), strings.NewReader(`{"prompt":"hi"}`))
+	body := []byte(`{"prompt":"hi"}`)
+	req, err := http.NewRequest("POST", fmt.Sprintf("http://%s/model/foo/invoke", proxy.HTTPAddr), strings.NewReader(string(body)))
 	require.NoError(t, err)
 	req.Host = upstreamHost
 	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = int64(len(body))
+
+	// Sign with placeholder credentials, like an AWS SDK would when configured
+	// to talk to a sigv4 proxy. The proxy is expected to read the scope, drop
+	// this signature, and re-sign with the real env-provided credentials.
+	placeholder := aws.Credentials{
+		AccessKeyID:     "AKIAIOSFODNN7EXAMPLE",
+		SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+	}
+	sum := sha256.Sum256(body)
+	require.NoError(t, v4.NewSigner().SignHTTP(
+		context.Background(), placeholder, req, hex.EncodeToString(sum[:]),
+		"bedrock", "us-east-1", time.Now().UTC(),
+	))
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -60,6 +82,7 @@ func TestAWSAuth(t *testing.T) {
 	defer mu.Unlock()
 	require.True(t, strings.HasPrefix(gotAuth, "AWS4-HMAC-SHA256 "), "Authorization = %q", gotAuth)
 	require.Contains(t, gotAuth, "Credential=AKIAEXAMPLE/")
+	require.NotContains(t, gotAuth, "AKIAIOSFODNN7EXAMPLE", "placeholder credential must not appear in outbound Authorization header")
 	require.Contains(t, gotAuth, "/us-east-1/bedrock/aws4_request")
 	require.Contains(t, gotAuth, "SignedHeaders=")
 	require.Contains(t, gotAuth, "Signature=")

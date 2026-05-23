@@ -1,8 +1,11 @@
 // Package awsauth implements an AWS Signature Version 4 request-signing
-// transform. It signs matching outbound requests with credentials drawn from
-// the standard secret sources (env, aws_sm, aws_ssm, 1password, etc.) and
-// injects the resulting Authorization, X-Amz-Date, and X-Amz-Security-Token
-// headers using the AWS SDK's v4 signer.
+// transform. The inbound request is expected to already carry a SigV4
+// signature produced by any AWS SDK using placeholder credentials. This
+// transform reads the region and service from the inbound credential scope,
+// strips the placeholder signature, and re-signs the request with real
+// credentials drawn from a registered secret source (env, aws_sm, aws_ssm,
+// 1password, ...). This lets a single transform entry handle every AWS
+// service a client speaks to without enumerating them in config.
 //
 // Like hmac_sign, this requires MITM mode: sni-only mode has no method, path,
 // or body to sign. A truncated body would produce an invalid signature, so
@@ -16,11 +19,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -36,21 +41,25 @@ func init() {
 	transform.Register("aws_auth", factory)
 }
 
-// unsignedPayload is the literal placeholder AWS accepts in lieu of a real
-// SHA-256 payload hash. S3, Bedrock streaming, etc. document this value.
-const unsignedPayload = "UNSIGNED-PAYLOAD"
+const (
+	// unsignedPayload is the literal placeholder AWS accepts in lieu of a real
+	// SHA-256 payload hash. S3, Bedrock streaming, etc. document this value.
+	unsignedPayload = "UNSIGNED-PAYLOAD"
 
-// emptyPayloadSHA256 is the hex SHA-256 of the empty string, used when the
-// request has no body. Per the SDK docs SignHTTP always requires a payload
-// hash, even for empty bodies.
-const emptyPayloadSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	// emptyPayloadSHA256 is the hex SHA-256 of the empty string, used when the
+	// request has no body. Per the SDK docs SignHTTP always requires a payload
+	// hash, even for empty bodies.
+	emptyPayloadSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+	sigV4Algorithm = "AWS4-HMAC-SHA256"
+)
 
 type config struct {
-	Region           string                 `yaml:"region"`
-	Service          string                 `yaml:"service"`
 	AccessKeyID      yaml.Node              `yaml:"access_key_id"`
 	SecretAccessKey  yaml.Node              `yaml:"secret_access_key"`
 	SessionToken     yaml.Node              `yaml:"session_token,omitempty"`
+	AllowedRegions   []string               `yaml:"allowed_regions,omitempty"`
+	AllowedServices  []string               `yaml:"allowed_services,omitempty"`
 	UnsignedPayload  bool                   `yaml:"unsigned_payload,omitempty"`
 	AllowChunkedBody bool                   `yaml:"allow_chunked_body,omitempty"`
 	Rules            []hostmatch.RuleConfig `yaml:"rules"`
@@ -69,8 +78,8 @@ type signFunc func(ctx context.Context, creds aws.Credentials, req *http.Request
 type AWSAuth struct {
 	logger           *slog.Logger
 	rules            []hostmatch.Rule
-	region           string
-	service          string
+	allowedRegions   map[string]struct{} // nil → allow any
+	allowedServices  map[string]struct{} // nil → allow any
 	accessKeyID      secrets.Source
 	secretAccessKey  secrets.Source
 	sessionToken     secrets.Source // nil when omitted
@@ -90,12 +99,6 @@ func factory(cfg yaml.Node, logger *slog.Logger) (transform.Transformer, error) 
 }
 
 func newFromConfig(c config, logger *slog.Logger, build sourceBuilder) (*AWSAuth, error) {
-	if c.Region == "" {
-		return nil, fmt.Errorf("aws_auth: region is required")
-	}
-	if c.Service == "" {
-		return nil, fmt.Errorf("aws_auth: service is required")
-	}
 	if c.AccessKeyID.IsZero() {
 		return nil, fmt.Errorf("aws_auth: access_key_id is required")
 	}
@@ -131,8 +134,8 @@ func newFromConfig(c config, logger *slog.Logger, build sourceBuilder) (*AWSAuth
 	return &AWSAuth{
 		logger:           logger,
 		rules:            rules,
-		region:           c.Region,
-		service:          c.Service,
+		allowedRegions:   buildAllowSet(c.AllowedRegions),
+		allowedServices:  buildAllowSet(c.AllowedServices),
 		accessKeyID:      accessKey,
 		secretAccessKey:  secretKey,
 		sessionToken:     sessionToken,
@@ -145,11 +148,59 @@ func newFromConfig(c config, logger *slog.Logger, build sourceBuilder) (*AWSAuth
 	}, nil
 }
 
+func buildAllowSet(items []string) map[string]struct{} {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(items))
+	for _, v := range items {
+		if v == "" {
+			continue
+		}
+		out[v] = struct{}{}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func (a *AWSAuth) Name() string { return "aws_auth" }
 
 func (a *AWSAuth) TransformRequest(ctx context.Context, tctx *transform.TransformContext, req *http.Request) (*transform.TransformResult, error) {
 	if !hostmatch.MatchAnyRule(a.rules, req) {
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
+	}
+
+	scope, err := parseInboundScope(req)
+	if err != nil {
+		tctx.Annotate("rejected", "missing_sigv4")
+		tctx.Annotate("error", err.Error())
+		return &transform.TransformResult{
+			Action:   transform.ActionReject,
+			Response: errorResponse(req, http.StatusBadRequest, "missing_sigv4"),
+		}, nil
+	}
+
+	if a.allowedRegions != nil {
+		if _, ok := a.allowedRegions[scope.region]; !ok {
+			tctx.Annotate("rejected", "region_not_allowed")
+			tctx.Annotate("region", scope.region)
+			return &transform.TransformResult{
+				Action:   transform.ActionReject,
+				Response: errorResponse(req, http.StatusForbidden, "region_not_allowed"),
+			}, nil
+		}
+	}
+	if a.allowedServices != nil {
+		if _, ok := a.allowedServices[scope.service]; !ok {
+			tctx.Annotate("rejected", "service_not_allowed")
+			tctx.Annotate("service", scope.service)
+			return &transform.TransformResult{
+				Action:   transform.ActionReject,
+				Response: errorResponse(req, http.StatusForbidden, "service_not_allowed"),
+			}, nil
+		}
 	}
 
 	accessKey, err := a.accessKeyID.Get(ctx)
@@ -173,12 +224,20 @@ func (a *AWSAuth) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		return reject, nil
 	}
 
+	// Strip the inbound placeholder signature so SignHTTP produces a fresh,
+	// untainted signature using only the headers we want signed.
+	stripInboundSignatureHeaders(req)
+	// X-Amz-Content-Sha256 is required by S3 and signed when present; setting
+	// it explicitly makes the signed canonical request deterministic across
+	// services.
+	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+
 	creds := aws.Credentials{
 		AccessKeyID:     accessKey,
 		SecretAccessKey: secretKey,
 		SessionToken:    token,
 	}
-	if err := a.sign(ctx, creds, req, payloadHash, a.service, a.region, a.now()); err != nil {
+	if err := a.sign(ctx, creds, req, payloadHash, scope.service, scope.region, a.now()); err != nil {
 		tctx.Annotate("rejected", "signing_failed")
 		tctx.Annotate("error", err.Error())
 		return &transform.TransformResult{
@@ -187,18 +246,82 @@ func (a *AWSAuth) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		}, nil
 	}
 
-	injected := []string{"header:Authorization", "header:X-Amz-Date"}
+	injected := []string{"header:Authorization", "header:X-Amz-Date", "header:X-Amz-Content-Sha256"}
 	if token != "" {
 		injected = append(injected, "header:X-Amz-Security-Token")
 	}
 	tctx.Annotate("injected", injected)
-	tctx.Annotate("service", a.service)
-	tctx.Annotate("region", a.region)
+	tctx.Annotate("service", scope.service)
+	tctx.Annotate("region", scope.region)
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
 }
 
 func (a *AWSAuth) TransformResponse(context.Context, *transform.TransformContext, *http.Request, *http.Response) (*transform.TransformResult, error) {
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
+}
+
+// credentialScope is the (region, service) pair extracted from an inbound
+// SigV4 signature.
+type credentialScope struct {
+	region  string
+	service string
+}
+
+var errNoSigV4 = errors.New("request has no SigV4 signature (no Authorization header or X-Amz-Credential query param)")
+
+// parseInboundScope extracts the credential scope from an inbound SigV4
+// signature. Normal requests carry the scope in the Authorization header;
+// pre-signed URLs carry it in the X-Amz-Credential query param.
+func parseInboundScope(req *http.Request) (credentialScope, error) {
+	if auth := req.Header.Get("Authorization"); auth != "" {
+		return parseAuthHeaderScope(auth)
+	}
+	if cred := req.URL.Query().Get("X-Amz-Credential"); cred != "" {
+		return parseCredentialPath(cred)
+	}
+	return credentialScope{}, errNoSigV4
+}
+
+// parseAuthHeaderScope pulls the Credential= field out of a SigV4
+// Authorization header.
+func parseAuthHeaderScope(auth string) (credentialScope, error) {
+	rest, ok := strings.CutPrefix(auth, sigV4Algorithm+" ")
+	if !ok {
+		return credentialScope{}, fmt.Errorf("Authorization header is not %s", sigV4Algorithm)
+	}
+	for _, part := range strings.Split(rest, ",") {
+		part = strings.TrimSpace(part)
+		if cred, ok := strings.CutPrefix(part, "Credential="); ok {
+			return parseCredentialPath(cred)
+		}
+	}
+	return credentialScope{}, errors.New("Authorization header missing Credential field")
+}
+
+// parseCredentialPath parses ACCESSKEY/DATE/REGION/SERVICE/aws4_request.
+func parseCredentialPath(cred string) (credentialScope, error) {
+	parts := strings.Split(cred, "/")
+	if len(parts) != 5 {
+		return credentialScope{}, fmt.Errorf("malformed credential scope %q: expected 5 path segments, got %d", cred, len(parts))
+	}
+	if parts[4] != "aws4_request" {
+		return credentialScope{}, fmt.Errorf("malformed credential scope %q: expected aws4_request terminator", cred)
+	}
+	if parts[2] == "" || parts[3] == "" {
+		return credentialScope{}, fmt.Errorf("malformed credential scope %q: empty region or service", cred)
+	}
+	return credentialScope{region: parts[2], service: parts[3]}, nil
+}
+
+// stripInboundSignatureHeaders removes every header SignHTTP is going to
+// rewrite. Leaving the placeholder Authorization header in place would cause
+// the SDK signer to include it in the canonical request, which produces a
+// signature the upstream cannot verify.
+func stripInboundSignatureHeaders(req *http.Request) {
+	req.Header.Del("Authorization")
+	req.Header.Del("X-Amz-Date")
+	req.Header.Del("X-Amz-Security-Token")
+	req.Header.Del("X-Amz-Content-Sha256")
 }
 
 // payloadHash returns the SHA-256 hex hash of the request body, or the
