@@ -287,7 +287,7 @@ func parseInboundScope(req *http.Request) (credentialScope, error) {
 func parseAuthHeaderScope(auth string) (credentialScope, error) {
 	rest, ok := strings.CutPrefix(auth, sigV4Algorithm+" ")
 	if !ok {
-		return credentialScope{}, fmt.Errorf("Authorization header is not %s", sigV4Algorithm)
+		return credentialScope{}, fmt.Errorf("not a %s Authorization header", sigV4Algorithm)
 	}
 	for _, part := range strings.Split(rest, ",") {
 		part = strings.TrimSpace(part)
@@ -295,7 +295,7 @@ func parseAuthHeaderScope(auth string) (credentialScope, error) {
 			return parseCredentialPath(cred)
 		}
 	}
-	return credentialScope{}, errors.New("Authorization header missing Credential field")
+	return credentialScope{}, errors.New("missing Credential field in Authorization header")
 }
 
 // parseCredentialPath parses ACCESSKEY/DATE/REGION/SERVICE/aws4_request.

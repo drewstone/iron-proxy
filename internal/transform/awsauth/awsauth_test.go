@@ -216,7 +216,7 @@ func TestParseInboundScope(t *testing.T) {
 		require.NoError(t, err)
 		req.Header.Set("Authorization", "Bearer abc")
 		_, err = parseInboundScope(req)
-		require.ErrorContains(t, err, "not AWS4-HMAC-SHA256")
+		require.ErrorContains(t, err, "not a AWS4-HMAC-SHA256")
 	})
 
 	t.Run("rejects Authorization header missing Credential field", func(t *testing.T) {
@@ -224,7 +224,7 @@ func TestParseInboundScope(t *testing.T) {
 		require.NoError(t, err)
 		req.Header.Set("Authorization", "AWS4-HMAC-SHA256 SignedHeaders=host, Signature=abc")
 		_, err = parseInboundScope(req)
-		require.ErrorContains(t, err, "missing Credential field")
+		require.ErrorContains(t, err, "missing Credential field in Authorization header")
 	})
 
 	t.Run("rejects malformed credential scope", func(t *testing.T) {
