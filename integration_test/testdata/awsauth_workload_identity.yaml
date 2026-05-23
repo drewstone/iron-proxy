@@ -20,11 +20,6 @@ transforms:
 
   - name: aws_auth
     config:
-      # workload_identity defers to the AWS SDK default credential chain. The
-      # chain's first leg reads AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
-      # AWS_SESSION_TOKEN from the proxy's env, so this exercises the
-      # workload_identity provider end-to-end without needing real IRSA or
-      # IMDS.
       credentials_provider:
         type: workload_identity
       rules:

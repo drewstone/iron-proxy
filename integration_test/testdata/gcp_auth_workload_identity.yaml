@@ -20,11 +20,6 @@ transforms:
 
   - name: gcp_auth
     config:
-      # workload_identity defers to Google Application Default Credentials. In
-      # this test ADC is steered to a generated service-account JSON via
-      # GOOGLE_APPLICATION_CREDENTIALS so the test runs without GKE / metadata
-      # server infrastructure. The keyfile's token_uri points at a local
-      # httptest server that mints a fake bearer.
       credentials_provider:
         type: workload_identity
       scopes:

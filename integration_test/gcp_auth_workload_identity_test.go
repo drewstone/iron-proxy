@@ -1,11 +1,7 @@
 package integration_test
 
 import (
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,13 +15,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestGCPAuthWorkloadIdentity boots the proxy with gcp_auth configured via
-// credentials_provider: workload_identity. ADC is steered to a generated
-// service-account JSON keyfile via GOOGLE_APPLICATION_CREDENTIALS, with its
-// token_uri pointing at a local httptest server that mints a fake bearer.
-// This exercises the full workload_identity → google.FindDefaultCredentials →
-// TokenSource path without requiring GKE Workload Identity or a real GCP
-// metadata server, and confirms the minted bearer reaches the upstream.
+// TestGCPAuthWorkloadIdentity drives credentials_provider: workload_identity
+// end-to-end without real GCP infra by steering ADC at a synthetic
+// service-account JSON whose token_uri is a local httptest server.
 func TestGCPAuthWorkloadIdentity(t *testing.T) {
 	tmpDir := t.TempDir()
 	binary := proxyBinary(t)
@@ -88,22 +80,14 @@ func TestGCPAuthWorkloadIdentity(t *testing.T) {
 	require.Equal(t, int64(1), tokenCalls.Load(), "token endpoint should be hit exactly once and then cached")
 }
 
-// writeWorkloadIdentityKeyfile generates a service-account JSON keyfile with a
-// freshly minted RSA key and a tokenURI pointing at the test's fake token
-// server. google.FindDefaultCredentials accepts this via the
-// GOOGLE_APPLICATION_CREDENTIALS env leg of the ADC chain.
+// writeWorkloadIdentityKeyfile writes a minimal service-account JSON whose
+// token_uri points at a local fake. Loadable via GOOGLE_APPLICATION_CREDENTIALS.
 func writeWorkloadIdentityKeyfile(t *testing.T, dir, tokenURI string) string {
 	t.Helper()
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
-	der, err := x509.MarshalPKCS8PrivateKey(key)
-	require.NoError(t, err)
-	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
-
 	keyfile := map[string]string{
 		"type":         "service_account",
 		"project_id":   "iron-proxy-workload-identity-test",
-		"private_key":  string(pemBytes),
+		"private_key":  generateServiceAccountKeyPEM(t),
 		"client_email": "workload-identity@iron-proxy-test.iam.gserviceaccount.com",
 		"token_uri":    tokenURI,
 	}

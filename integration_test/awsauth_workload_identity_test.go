@@ -18,13 +18,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestAWSAuthWorkloadIdentity boots the proxy with the aws_auth transform
-// configured via credentials_provider: workload_identity. The proxy's env
-// carries AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN, which
-// the AWS SDK default credential chain resolves at first Retrieve. This
-// exercises the full workload_identity → lazyDefaultChainProvider →
-// awsconfig.LoadDefaultConfig path without requiring real IRSA / IMDS infra,
-// and confirms that a session token flows through to the outbound request.
+// TestAWSAuthWorkloadIdentity drives credentials_provider: workload_identity
+// end-to-end via the env leg of the AWS SDK default chain. Also covers that
+// AWS_SESSION_TOKEN flows through to the outbound X-Amz-Security-Token header.
 func TestAWSAuthWorkloadIdentity(t *testing.T) {
 	tmpDir := t.TempDir()
 	binary := proxyBinary(t)
@@ -50,10 +46,9 @@ func TestAWSAuthWorkloadIdentity(t *testing.T) {
 		"AWS_ACCESS_KEY_ID=AKIAEXAMPLE",
 		"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
 		"AWS_SESSION_TOKEN=test-workload-session-token",
-		// Skip the default-region IMDS lookup in CI: the AWS SDK only reads
-		// region from env (not creds), and the signer takes its region from
-		// the inbound credential scope, but LoadDefaultConfig probes IMDS for
-		// region metadata otherwise.
+		// Set AWS_REGION so LoadDefaultConfig does not probe IMDS for region
+		// metadata in CI (we don't sign with this region — the signer takes
+		// it from the inbound credential scope).
 		"AWS_REGION=us-east-1",
 	}
 	proxy := startProxy(t, binary, cfgPath, env)
