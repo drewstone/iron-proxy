@@ -30,6 +30,7 @@ domains:
   # GoReleaser
   - "goreleaser.com"
   - "*.goreleaser.com"
+  - "api.gumroad.com" # GoReleaser Pro license validation
 
   # AWS (for integration tests)
   - "secretsmanager.us-west-1.amazonaws.com"
