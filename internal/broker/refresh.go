@@ -234,11 +234,3 @@ type errorResponse struct {
 	ErrorURI         string `json:"error_uri"`
 }
 
-// RFC 6749 5.2 error codes referenced in tests. Kept as named constants
-// for readability; the broker itself no longer dispatches on specific
-// codes — any present code is treated as unrecoverable.
-const (
-	oauthErrInvalidGrant       = "invalid_grant"
-	oauthErrInvalidClient      = "invalid_client"
-	oauthErrUnauthorizedClient = "unauthorized_client"
-)
