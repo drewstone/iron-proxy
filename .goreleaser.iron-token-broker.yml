@@ -36,7 +36,7 @@ dockers_v2:
       - "ironsh/iron-token-broker"
     tags:
       - "{{ .Version }}"
-      - "latest"
+      - '{{ if not .Prerelease }}latest{{ end }}'
     dockerfile: Dockerfile.broker.release
 
 checksum:
