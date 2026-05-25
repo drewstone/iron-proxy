@@ -42,5 +42,17 @@ dockers_v2:
 checksum:
   name_template: "checksums.txt"
 
+release:
+  prerelease: auto
+
 changelog:
   sort: asc
+  filters:
+    include:
+      - "(?i)broker"
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^style:"
+      - "^Merge"
