@@ -12,27 +12,31 @@ tls:
   ca_key: tmp/ca.key
 
 postgres:
-  - name: primary
+  - name: main
     listen: "127.0.0.1:0"
-    upstream:
-      dsn:
-        type: env
-        var: PG_UPSTREAM_DSN
-    client:
-      user: app_user
-      password_env: PG_PROXY_PASSWORD
-    role: tenant_role
+    routes:
+      # Both routes front the same physical upstream (appdb) but inject a
+      # different role. The client picks the route by the database name it
+      # requests; the upstream database is whatever the DSN names.
+      - database: tenant
+        upstream:
+          dsn:
+            type: env
+            var: PG_UPSTREAM_DSN
+        client:
+          user: app_user
+          password_env: PG_PROXY_PASSWORD
+        role: tenant_role
 
-  - name: secondary
-    listen: "127.0.0.1:0"
-    upstream:
-      dsn:
-        type: env
-        var: PG_UPSTREAM_DSN
-    client:
-      user: app_user
-      password_env: PG_PROXY_PASSWORD
-    role: other_role
+      - database: other
+        upstream:
+          dsn:
+            type: env
+            var: PG_UPSTREAM_DSN
+        client:
+          user: app_user
+          password_env: PG_PROXY_PASSWORD
+        role: other_role
 
 metrics:
   listen: "127.0.0.1:0"

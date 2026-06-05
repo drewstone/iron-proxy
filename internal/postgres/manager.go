@@ -9,7 +9,7 @@ import (
 
 // Manager owns the running set of postgres listener servers and supports
 // hot reload by closing the old set and starting a new one from updated
-// policies. Safe for concurrent use.
+// listeners. Safe for concurrent use.
 type Manager struct {
 	logger *slog.Logger
 
@@ -22,26 +22,26 @@ func NewManager(logger *slog.Logger) *Manager {
 	return &Manager{logger: logger}
 }
 
-// Start launches a listener for each policy. A listener that exits with a
+// Start launches a server for each listener. A server that exits with a
 // non-nil error sends it to errc so the calling process can treat it as
 // fatal; bind failures during a subsequent Reload are logged instead.
-func (m *Manager) Start(policies []*Policy, errc chan<- error) {
+func (m *Manager) Start(listeners []*Listener, errc chan<- error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, p := range policies {
-		srv := NewServer(p, m.logger)
+	for _, l := range listeners {
+		srv := NewServer(l, m.logger)
 		m.servers = append(m.servers, srv)
 		go m.run(srv, errc)
 	}
 }
 
-// Reload closes all running listeners and starts a new set from policies.
-// In-flight client sessions on the closed listeners are not interrupted, but
-// no new connections will be accepted on the old addresses. ctx bounds the
-// shutdown of the old listeners. Listener failures during reload (e.g.
-// address already in use) are logged, not fatal: the management /v1/reload
+// Reload closes all running listeners and starts a new set from the given
+// listeners. In-flight client sessions on the closed listeners are not
+// interrupted, but no new connections will be accepted on the old addresses.
+// ctx bounds the shutdown of the old listeners. Listener failures during reload
+// (e.g. address already in use) are logged, not fatal: the management /v1/reload
 // caller has already received a 200.
-func (m *Manager) Reload(ctx context.Context, policies []*Policy) {
+func (m *Manager) Reload(ctx context.Context, listeners []*Listener) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -54,9 +54,9 @@ func (m *Manager) Reload(ctx context.Context, policies []*Policy) {
 		}
 	}
 
-	m.servers = make([]*Server, 0, len(policies))
-	for _, p := range policies {
-		srv := NewServer(p, m.logger)
+	m.servers = make([]*Server, 0, len(listeners))
+	for _, l := range listeners {
+		srv := NewServer(l, m.logger)
 		m.servers = append(m.servers, srv)
 		go m.run(srv, nil)
 	}

@@ -374,11 +374,14 @@ func TestPostgresPolicy(t *testing.T) {
 	})
 }
 
-// TestPostgresMultipleServers boots one Postgres container and an iron-proxy
-// with two postgres listeners pointing at it — each configured with a
-// different injected role. Verifies they enforce their own roles
-// independently, including RLS scoping.
-func TestPostgresMultipleServers(t *testing.T) {
+// TestPostgresMultipleRoutes boots one Postgres container and an iron-proxy
+// with a single postgres listener that fronts two routes — each keyed by a
+// distinct database name and configured with a different injected role. Both
+// routes share the same physical upstream; the client selects between them by
+// the database name it requests. Verifies each route enforces its own role
+// independently, including RLS scoping, and that an unknown database is
+// rejected.
+func TestPostgresMultipleRoutes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
@@ -412,21 +415,21 @@ func TestPostgresMultipleServers(t *testing.T) {
 	}
 	proxy := startProxy(t, proxyBinary(t), cfgPath, env)
 
-	primaryAddr := proxy.AddrForNamed(t, "postgres proxy starting", "primary")
-	secondaryAddr := proxy.AddrForNamed(t, "postgres proxy starting", "secondary")
-	require.NotEqual(t, primaryAddr, secondaryAddr, "each named server must bind a distinct port")
+	pgAddr := proxy.AddrFor(t, "postgres proxy starting")
 
-	connStrTo := func(addr string) string {
-		host, port, _ := net.SplitHostPort(addr)
+	// connStrTo selects a route by the database name in the DSN. Both routes
+	// live on the same listener; only the database differs.
+	connStrTo := func(database string) string {
+		host, port, _ := net.SplitHostPort(pgAddr)
 		return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
-			pgClientUser, pgClientPassword, host, port, pgUpstreamDB)
+			pgClientUser, pgClientPassword, host, port, database)
 	}
 
-	queryRole := func(t *testing.T, addr string) string {
+	queryRole := func(t *testing.T, database string) string {
 		t.Helper()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		conn, err := pgconn.Connect(ctx, connStrTo(addr))
+		conn, err := pgconn.Connect(ctx, connStrTo(database))
 		require.NoError(t, err)
 		defer func() { _ = conn.Close(context.Background()) }()
 		results, err := conn.Exec(ctx, "SELECT current_role").ReadAll()
@@ -436,29 +439,39 @@ func TestPostgresMultipleServers(t *testing.T) {
 		return string(results[0].Rows[0][0])
 	}
 
-	t.Run("each listener enforces its own role", func(t *testing.T) {
-		require.Equal(t, "tenant_role", queryRole(t, primaryAddr))
-		require.Equal(t, "other_role", queryRole(t, secondaryAddr))
+	t.Run("each route enforces its own role", func(t *testing.T) {
+		require.Equal(t, "tenant_role", queryRole(t, "tenant"))
+		require.Equal(t, "other_role", queryRole(t, "other"))
 	})
 
-	t.Run("rls scopes rows differently per listener", func(t *testing.T) {
+	t.Run("rls scopes rows differently per route", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		// Through the primary listener: tenant_role sees only tenant_role's rows.
-		primary, err := pgx.Connect(ctx, connStrTo(primaryAddr))
+		// Through the tenant route: tenant_role sees only tenant_role's rows.
+		tenant, err := pgx.Connect(ctx, connStrTo("tenant"))
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = primary.Close(ctx) })
-		var primaryCount int
-		require.NoError(t, primary.QueryRow(ctx, "SELECT count(*) FROM items").Scan(&primaryCount))
-		require.Equal(t, 2, primaryCount, "primary listener should see only tenant_role's rows")
+		t.Cleanup(func() { _ = tenant.Close(ctx) })
+		var tenantCount int
+		require.NoError(t, tenant.QueryRow(ctx, "SELECT count(*) FROM items").Scan(&tenantCount))
+		require.Equal(t, 2, tenantCount, "tenant route should see only tenant_role's rows")
 
-		// Through the secondary listener: other_role sees only other_role's rows.
-		secondary, err := pgx.Connect(ctx, connStrTo(secondaryAddr))
+		// Through the other route: other_role sees only other_role's rows.
+		other, err := pgx.Connect(ctx, connStrTo("other"))
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = secondary.Close(ctx) })
-		var secondaryCount int
-		require.NoError(t, secondary.QueryRow(ctx, "SELECT count(*) FROM items").Scan(&secondaryCount))
-		require.Equal(t, 3, secondaryCount, "secondary listener should see only other_role's rows")
+		t.Cleanup(func() { _ = other.Close(ctx) })
+		var otherCount int
+		require.NoError(t, other.QueryRow(ctx, "SELECT count(*) FROM items").Scan(&otherCount))
+		require.Equal(t, 3, otherCount, "other route should see only other_role's rows")
+	})
+
+	t.Run("unknown database is rejected", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := pgconn.Connect(ctx, connStrTo("nonexistent"))
+		require.Error(t, err, "a database with no matching route must be rejected")
+		var pgErr *pgconn.PgError
+		require.True(t, errors.As(err, &pgErr), "want PgError, got %T: %v", err, err)
+		require.Equal(t, "3D000", pgErr.Code)
 	})
 }

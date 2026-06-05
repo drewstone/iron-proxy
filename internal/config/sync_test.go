@@ -38,6 +38,7 @@ func TestPostgresFromSync_ParsesEntries(t *testing.T) {
 	require.Len(t, entries, 2)
 
 	require.Equal(t, "pg-analytics", entries[0].ForeignID)
+	require.Equal(t, "pg-analytics", entries[0].Database, "database defaults to foreign_id")
 	require.Equal(t, "readonly", entries[0].Role)
 	require.NotNil(t, entries[0].DSN)
 	got, err := entries[0].DSN.Get(context.Background())
@@ -45,7 +46,19 @@ func TestPostgresFromSync_ParsesEntries(t *testing.T) {
 	require.Equal(t, "host=analytics", got)
 
 	require.Equal(t, "pg-main", entries[1].ForeignID)
+	require.Equal(t, "pg-main", entries[1].Database)
 	require.Empty(t, entries[1].Role)
+}
+
+func TestPostgresFromSync_ExplicitDatabase(t *testing.T) {
+	t.Setenv("PG_DSN", "host=x")
+	raw := json.RawMessage(`[{"id":"pgs_1","foreign_id":"pg-analytics","database":"analytics","dsn":{"type":"env","var":"PG_DSN"}}]`)
+
+	entries, err := PostgresFromSync(raw, syncTestLogger())
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, "pg-analytics", entries[0].ForeignID)
+	require.Equal(t, "analytics", entries[0].Database, "explicit database overrides the foreign_id default")
 }
 
 func TestPostgresFromSync_SkipsNullElements(t *testing.T) {

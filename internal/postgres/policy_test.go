@@ -63,33 +63,57 @@ func TestClassifyClientStatement(t *testing.T) {
 	}
 }
 
-func TestNewManagedPolicy(t *testing.T) {
+func TestNewManagedRoute(t *testing.T) {
 	dsn := staticDSN{name: "dsn", value: "host=db"}
 
-	p, err := NewManagedPolicy("pg-analytics", "127.0.0.1:6432", dsn, "app", "pw", "readonly")
+	r, err := NewManagedRoute("analytics", dsn, "app", "pw", "readonly")
 	require.NoError(t, err)
-	require.Equal(t, "pg-analytics", p.Name())
-	require.Equal(t, "127.0.0.1:6432", p.Listen())
-	require.Equal(t, "readonly", p.Role())
-	require.True(t, p.VerifyClient("app", "pw"))
-	require.False(t, p.VerifyClient("app", "wrong"))
+	require.Equal(t, "analytics", r.Database())
+	require.Equal(t, "readonly", r.Role())
+	require.True(t, r.VerifyClient("app", "pw"))
+	require.False(t, r.VerifyClient("app", "wrong"))
 
 	// Absent role is allowed (no SET ROLE issued).
-	p, err = NewManagedPolicy("pg-main", "127.0.0.1:6433", dsn, "app", "pw", "")
+	r, err = NewManagedRoute("main", dsn, "app", "pw", "")
 	require.NoError(t, err)
-	require.Empty(t, p.Role())
+	require.Empty(t, r.Role())
 
 	// Required fields.
-	_, err = NewManagedPolicy("", "127.0.0.1:0", dsn, "app", "pw", "")
-	require.ErrorContains(t, err, "name is required")
-	_, err = NewManagedPolicy("n", "", dsn, "app", "pw", "")
-	require.ErrorContains(t, err, "listen is required")
-	_, err = NewManagedPolicy("n", "127.0.0.1:0", nil, "app", "pw", "")
+	_, err = NewManagedRoute("", dsn, "app", "pw", "")
+	require.ErrorContains(t, err, "database is required")
+	_, err = NewManagedRoute("d", nil, "app", "pw", "")
 	require.ErrorContains(t, err, "dsn source is required")
-	_, err = NewManagedPolicy("n", "127.0.0.1:0", dsn, "", "pw", "")
+	_, err = NewManagedRoute("d", dsn, "", "pw", "")
 	require.ErrorContains(t, err, "client user is required")
-	_, err = NewManagedPolicy("n", "127.0.0.1:0", dsn, "app", "", "")
+	_, err = NewManagedRoute("d", dsn, "app", "", "")
 	require.ErrorContains(t, err, "client password is required")
+}
+
+func TestNewListener(t *testing.T) {
+	dsn := staticDSN{name: "dsn", value: "host=db"}
+	mustRoute := func(database string) *Route {
+		r, err := NewManagedRoute(database, dsn, "app", "pw", "")
+		require.NoError(t, err)
+		return r
+	}
+
+	l, err := NewListener("main", "127.0.0.1:0", []*Route{mustRoute("a"), mustRoute("b")})
+	require.NoError(t, err)
+	require.Equal(t, "main", l.Name())
+	require.Equal(t, "127.0.0.1:0", l.Listen())
+	require.Equal(t, "a", l.Route("a").Database())
+	require.Equal(t, "b", l.Route("b").Database())
+	require.Nil(t, l.Route("missing"))
+
+	// Required fields and duplicate-database guard.
+	_, err = NewListener("", "127.0.0.1:0", []*Route{mustRoute("a")})
+	require.ErrorContains(t, err, "listener name is required")
+	_, err = NewListener("n", "", []*Route{mustRoute("a")})
+	require.ErrorContains(t, err, "listen is required")
+	_, err = NewListener("n", "127.0.0.1:0", nil)
+	require.ErrorContains(t, err, "at least one route is required")
+	_, err = NewListener("n", "127.0.0.1:0", []*Route{mustRoute("a"), mustRoute("a")})
+	require.ErrorContains(t, err, `duplicate route database "a"`)
 }
 
 func TestQuoteIdent(t *testing.T) {

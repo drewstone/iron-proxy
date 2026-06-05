@@ -11,21 +11,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// staticDSN is a no-op secrets.Source used to build test policies. The
+// staticDSN is a no-op secrets.Source used to build test listeners. The
 // manager tests never complete a postgres handshake; they only verify that
 // the listener is accepting TCP connections, so the DSN value is never read.
 type staticDSN struct{ name, value string }
 
-func (s staticDSN) Name() string                       { return s.name }
+func (s staticDSN) Name() string                        { return s.name }
 func (s staticDSN) Get(context.Context) (string, error) { return s.value, nil }
 
-func testPolicy(name, listen string) *Policy {
-	return &Policy{
-		name:           name,
-		listen:         listen,
-		upstreamDSN:    staticDSN{name: "test", value: "host=127.0.0.1"},
-		clientUser:     "u",
-		clientPassword: "p",
+func testListener(name, listen string) *Listener {
+	return &Listener{
+		name:   name,
+		listen: listen,
+		routes: map[string]*Route{
+			"appdb": {
+				database:       "appdb",
+				upstreamDSN:    staticDSN{name: "test", value: "host=127.0.0.1"},
+				clientUser:     "u",
+				clientPassword: "p",
+			},
+		},
 	}
 }
 
@@ -56,7 +61,7 @@ func TestManagerReload(t *testing.T) {
 	m := NewManager(logger)
 	errc := make(chan error, 2)
 
-	m.Start([]*Policy{testPolicy("initial", "127.0.0.1:0")}, errc)
+	m.Start([]*Listener{testListener("initial", "127.0.0.1:0")}, errc)
 	oldAddr := waitForListener(t, m)
 
 	// Old listener is accepting connections.
@@ -65,7 +70,7 @@ func TestManagerReload(t *testing.T) {
 	require.NoError(t, c.Close())
 
 	// Reload swaps in a new policy. The old listener closes; a new one binds.
-	m.Reload(context.Background(), []*Policy{testPolicy("reloaded", "127.0.0.1:0")})
+	m.Reload(context.Background(), []*Listener{testListener("reloaded", "127.0.0.1:0")})
 	newAddr := waitForListener(t, m)
 	require.NotEqual(t, oldAddr, newAddr)
 	require.Equal(t, []string{"reloaded"}, m.Names())
@@ -93,7 +98,7 @@ func TestManagerReloadToEmpty(t *testing.T) {
 	m := NewManager(logger)
 	errc := make(chan error, 1)
 
-	m.Start([]*Policy{testPolicy("initial", "127.0.0.1:0")}, errc)
+	m.Start([]*Listener{testListener("initial", "127.0.0.1:0")}, errc)
 	oldAddr := waitForListener(t, m)
 
 	m.Reload(context.Background(), nil)
