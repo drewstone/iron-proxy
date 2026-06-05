@@ -97,22 +97,20 @@ func TestNewListener(t *testing.T) {
 		return r
 	}
 
-	l, err := NewListener("main", "127.0.0.1:0", []*Route{mustRoute("a"), mustRoute("b")})
+	l, err := NewListener("127.0.0.1:0", []*Route{mustRoute("a"), mustRoute("b")})
 	require.NoError(t, err)
-	require.Equal(t, "main", l.Name())
 	require.Equal(t, "127.0.0.1:0", l.Listen())
 	require.Equal(t, "a", l.Route("a").Database())
 	require.Equal(t, "b", l.Route("b").Database())
 	require.Nil(t, l.Route("missing"))
+	require.Len(t, l.Routes(), 2)
 
 	// Required fields and duplicate-database guard.
-	_, err = NewListener("", "127.0.0.1:0", []*Route{mustRoute("a")})
-	require.ErrorContains(t, err, "listener name is required")
-	_, err = NewListener("n", "", []*Route{mustRoute("a")})
+	_, err = NewListener("", []*Route{mustRoute("a")})
 	require.ErrorContains(t, err, "listen is required")
-	_, err = NewListener("n", "127.0.0.1:0", nil)
+	_, err = NewListener("127.0.0.1:0", nil)
 	require.ErrorContains(t, err, "at least one route is required")
-	_, err = NewListener("n", "127.0.0.1:0", []*Route{mustRoute("a"), mustRoute("a")})
+	_, err = NewListener("127.0.0.1:0", []*Route{mustRoute("a"), mustRoute("a")})
 	require.ErrorContains(t, err, `duplicate route database "a"`)
 }
 

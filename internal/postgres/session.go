@@ -36,12 +36,16 @@ func runSession(ctx context.Context, clientConn net.Conn, listener *Listener, lo
 		return
 	}
 
-	// Select the route by the requested database. Postgres clients omit the
-	// database parameter when it equals the user, so fall back to the user name
-	// to match libpq's defaulting.
+	// Select the route by the requested database. The client must name a
+	// database explicitly; the proxy does not infer one from the user.
 	dbName := startup.Parameters["database"]
 	if dbName == "" {
-		dbName = startup.Parameters["user"]
+		writeFatal(backend, "3D000", "no database specified in startup message")
+		logger.Info("postgres: no database specified",
+			slog.String("listener", listener.Name()),
+			slog.String("remote", clientConn.RemoteAddr().String()),
+		)
+		return
 	}
 	route := listener.Route(dbName)
 	if route == nil {

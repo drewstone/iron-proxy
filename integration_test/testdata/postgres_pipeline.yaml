@@ -12,18 +12,17 @@ tls:
   ca_key: tmp/ca.key
 
 postgres:
-  - name: main
-    listen: "127.0.0.1:0"
-    routes:
-      - database: appdb
-        upstream:
-          dsn:
-            type: env
-            var: PG_UPSTREAM_DSN
-        client:
-          user: app_user
-          password_env: PG_PROXY_PASSWORD
-        role: tenant_role
+  listen: "127.0.0.1:0"
+  routes:
+    - database: appdb
+      upstream:
+        dsn:
+          type: env
+          var: PG_UPSTREAM_DSN
+      client:
+        user: app_user
+        password_env: PG_PROXY_PASSWORD
+      role: tenant_role
 
 metrics:
   listen: "127.0.0.1:0"

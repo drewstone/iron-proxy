@@ -26,10 +26,9 @@
 // postgres: key is a list of listeners, and each listener holds a list of
 // routes. A route is selected by the database name the client supplies in its
 // startup message; each route has its own upstream DSN, client credentials,
-// and optional injected role. One listen address can therefore serve many
-// databases. The top-level list still permits more than one listener (e.g. a
-// separate bind address per network segment), but most deployments configure
-// exactly one.
+// and optional injected role. One listen address therefore serves many
+// databases. The proxy runs a single postgres listener: the top-level
+// postgres: block is one object with a listen address and a list of routes.
 package postgres
 
 import (
@@ -47,13 +46,13 @@ import (
 // can inject a stub instead of constructing real source backends.
 type SourceBuilder func(yaml.Node, *slog.Logger) (secrets.Source, error)
 
-// ListenerConfig is one entry in the top-level postgres: list — a single bind
-// address fronting a set of database-keyed routes.
-type ListenerConfig struct {
-	// Name identifies the listener in logs and error messages. Required and
-	// must be unique across all postgres listeners in the config.
-	Name string `yaml:"name"`
+// listenerName is the fixed name of the single postgres listener, surfaced in
+// logs. The proxy runs at most one listener, so the name is not configurable.
+const listenerName = "postgres"
 
+// ListenerConfig is the top-level postgres: block — a single bind address
+// fronting a set of database-keyed routes.
+type ListenerConfig struct {
 	// Listen is the proxy's bind address for client connections, e.g. ":5432".
 	Listen string `yaml:"listen"`
 
@@ -111,7 +110,7 @@ type Listener struct {
 	routes map[string]*Route
 }
 
-// Name returns the listener's configured name.
+// Name returns the listener's name (a fixed identifier surfaced in logs).
 func (l *Listener) Name() string { return l.name }
 
 // Listen returns the bind address.
@@ -120,6 +119,15 @@ func (l *Listener) Listen() string { return l.listen }
 // Route returns the route for the given database name, or nil if no route on
 // this listener serves it.
 func (l *Listener) Route(database string) *Route { return l.routes[database] }
+
+// Routes returns all of the listener's routes. The order is unspecified.
+func (l *Listener) Routes() []*Route {
+	out := make([]*Route, 0, len(l.routes))
+	for _, r := range l.routes {
+		out = append(out, r)
+	}
+	return out
+}
 
 // Route is the compiled, runtime form of a single RouteConfig: one upstream
 // database with its own credentials and optional injected role.
@@ -157,74 +165,41 @@ func (r *Route) VerifyClient(user, password string) bool {
 // ClientUser returns the user clients must present to use this route.
 func (r *Route) ClientUser() string { return r.clientUser }
 
-// LoadFromNode decodes a raw yaml.Node into a list of ListenerConfigs and
-// compiles each into a Listener. An empty node (the postgres: key absent from
-// the source document) returns (nil, nil) so callers can treat "no postgres
-// listeners" as a normal case. An empty list (`postgres: []`) returns the
-// same.
-func LoadFromNode(node yaml.Node, logger *slog.Logger) ([]*Listener, error) {
+// LoadFromNode decodes the raw postgres: yaml.Node into a ListenerConfig and
+// compiles it into a Listener. An empty node (the postgres: key absent from the
+// source document) returns (nil, nil) so callers can treat "no postgres
+// listener" as a normal case. An empty block (no listen and no routes) returns
+// the same.
+func LoadFromNode(node yaml.Node, logger *slog.Logger) (*Listener, error) {
 	if node.Kind == 0 {
 		return nil, nil
 	}
-	var listeners []ListenerConfig
-	if err := node.Decode(&listeners); err != nil {
+	var c ListenerConfig
+	if err := node.Decode(&c); err != nil {
 		return nil, fmt.Errorf("decoding postgres config: %w", err)
 	}
-	return Compile(listeners, logger, secrets.BuildSource)
+	return Compile(c, logger, secrets.BuildSource)
 }
 
-// Compile validates and compiles ListenerConfigs into Listeners. Returns
-// (nil, nil) when the input list is empty so callers can treat "not
-// configured" as a no-op without a sentinel error.
-func Compile(listeners []ListenerConfig, logger *slog.Logger, buildSource SourceBuilder) ([]*Listener, error) {
-	if len(listeners) == 0 {
+// Compile validates and compiles a ListenerConfig into a Listener. Returns
+// (nil, nil) when the block is empty (no listen and no routes) so callers can
+// treat "not configured" as a no-op without a sentinel error.
+func Compile(c ListenerConfig, logger *slog.Logger, buildSource SourceBuilder) (*Listener, error) {
+	if c.Listen == "" && len(c.Routes) == 0 {
 		return nil, nil
 	}
-
-	seenNames := make(map[string]bool, len(listeners))
-	out := make([]*Listener, 0, len(listeners))
-
-	for i, c := range listeners {
-		l, err := compileOne(c, i, logger, buildSource)
-		if err != nil {
-			return nil, err
-		}
-		if seenNames[l.name] {
-			return nil, fmt.Errorf("postgres[%d]: duplicate listener name %q", i, l.name)
-		}
-		seenNames[l.name] = true
-		out = append(out, l)
-	}
-
-	// We deliberately don't validate listen-address uniqueness here: ":0"
-	// asks the OS to assign an ephemeral port, so two ":0" entries are
-	// legitimate (and used by tests). Real conflicts surface as a clean
-	// "address already in use" from net.Listen at startup.
-
-	return out, nil
-}
-
-func compileOne(c ListenerConfig, idx int, logger *slog.Logger, buildSource SourceBuilder) (*Listener, error) {
-	ctx := fmt.Sprintf("postgres[%d]", idx)
-	if c.Name != "" {
-		ctx = fmt.Sprintf("postgres[%q]", c.Name)
-	}
-
-	if c.Name == "" {
-		return nil, fmt.Errorf("%s: name is required", ctx)
-	}
 	if c.Listen == "" {
-		return nil, fmt.Errorf("%s: listen is required", ctx)
+		return nil, fmt.Errorf("postgres: listen is required")
 	}
 	if len(c.Routes) == 0 {
-		return nil, fmt.Errorf("%s: at least one route is required", ctx)
+		return nil, fmt.Errorf("postgres: at least one route is required")
 	}
 
 	routes := make(map[string]*Route, len(c.Routes))
 	for j, rc := range c.Routes {
-		rctx := fmt.Sprintf("%s.routes[%d]", ctx, j)
+		rctx := fmt.Sprintf("postgres.routes[%d]", j)
 		if rc.Database != "" {
-			rctx = fmt.Sprintf("%s.routes[%q]", ctx, rc.Database)
+			rctx = fmt.Sprintf("postgres.routes[%q]", rc.Database)
 		}
 
 		if rc.Database == "" {
@@ -240,7 +215,7 @@ func compileOne(c ListenerConfig, idx int, logger *slog.Logger, buildSource Sour
 			return nil, fmt.Errorf("%s: client.password_env is required", rctx)
 		}
 		if _, ok := routes[rc.Database]; ok {
-			return nil, fmt.Errorf("%s: duplicate route database %q", ctx, rc.Database)
+			return nil, fmt.Errorf("postgres: duplicate route database %q", rc.Database)
 		}
 
 		dsnSource, err := buildSource(rc.Upstream.DSN, logger)
@@ -263,36 +238,32 @@ func compileOne(c ListenerConfig, idx int, logger *slog.Logger, buildSource Sour
 	}
 
 	return &Listener{
-		name:   c.Name,
+		name:   listenerName,
 		listen: c.Listen,
 		routes: routes,
 	}, nil
 }
 
-// NewListener builds a Listener from a name, bind address, and a set of routes.
-// It is the construction path for control-plane-synced listeners, whose routes
-// are built one at a time via NewManagedRoute. The name and listen address are
+// NewListener builds the postgres listener from a bind address and a set of
+// routes. It is the construction path for control-plane-synced listeners, whose
+// routes are built one at a time via NewManagedRoute. The listen address is
 // required, and at least one route must be supplied; a route whose Database
 // collides with an earlier one is an error.
-func NewListener(name, listen string, routes []*Route) (*Listener, error) {
-	if name == "" {
-		return nil, fmt.Errorf("postgres: listener name is required")
-	}
-	ctx := fmt.Sprintf("postgres[%q]", name)
+func NewListener(listen string, routes []*Route) (*Listener, error) {
 	if listen == "" {
-		return nil, fmt.Errorf("%s: listen is required", ctx)
+		return nil, fmt.Errorf("postgres: listen is required")
 	}
 	if len(routes) == 0 {
-		return nil, fmt.Errorf("%s: at least one route is required", ctx)
+		return nil, fmt.Errorf("postgres: at least one route is required")
 	}
 	m := make(map[string]*Route, len(routes))
 	for _, r := range routes {
 		if _, ok := m[r.database]; ok {
-			return nil, fmt.Errorf("%s: duplicate route database %q", ctx, r.database)
+			return nil, fmt.Errorf("postgres: duplicate route database %q", r.database)
 		}
 		m[r.database] = r
 	}
-	return &Listener{name: name, listen: listen, routes: m}, nil
+	return &Listener{name: listenerName, listen: listen, routes: m}, nil
 }
 
 // NewManagedRoute builds a Route for a control-plane-synced listener. The

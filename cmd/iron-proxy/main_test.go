@@ -34,11 +34,11 @@ func discardLogger() *slog.Logger {
 
 // localListener builds a single-route local listener for conflict/passthrough
 // tests.
-func localListener(t *testing.T, name, database string) *postgres.Listener {
+func localListener(t *testing.T, database string) *postgres.Listener {
 	t.Helper()
 	r, err := postgres.NewManagedRoute(database, staticSource{name: "local", value: "host=local"}, "u", "p", "")
 	require.NoError(t, err)
-	l, err := postgres.NewListener(name, "127.0.0.1:0", []*postgres.Route{r})
+	l, err := postgres.NewListener("127.0.0.1:0", []*postgres.Route{r})
 	require.NoError(t, err)
 	return l
 }
@@ -58,7 +58,7 @@ func TestPgEnv(t *testing.T) {
 	}
 }
 
-func TestPostgresListenersFromSync_EnvPresent(t *testing.T) {
+func TestPostgresListenerFromSync_EnvPresent(t *testing.T) {
 	raw := json.RawMessage(`[{"id":"pgs_1","foreign_id":"pg-analytics","dsn":{"type":"env","var":"PG_ANALYTICS_DSN"},"role":"readonly"}]`)
 	getenv := mapEnv(map[string]string{
 		"IRON_PROXY_PG_LISTEN":                       "127.0.0.1:0",
@@ -66,20 +66,19 @@ func TestPostgresListenersFromSync_EnvPresent(t *testing.T) {
 		"IRON_PROXY_PG_PG_ANALYTICS_CLIENT_PASSWORD": "s3cret",
 	})
 
-	listeners, ok := postgresListenersFromSync(nil, getenv, discardLogger(), raw)
+	listener, ok := postgresListenerFromSync(nil, getenv, discardLogger(), raw)
 	require.True(t, ok)
-	require.Len(t, listeners, 1)
-	require.Equal(t, managedPgListenerName, listeners[0].Name())
-	require.Equal(t, "127.0.0.1:0", listeners[0].Listen())
+	require.NotNil(t, listener)
+	require.Equal(t, "127.0.0.1:0", listener.Listen())
 
 	// The foreign_id is the routing database when none is supplied.
-	route := listeners[0].Route("pg-analytics")
+	route := listener.Route("pg-analytics")
 	require.NotNil(t, route)
 	require.Equal(t, "readonly", route.Role())
 	require.True(t, route.VerifyClient("app", "s3cret"))
 }
 
-func TestPostgresListenersFromSync_ExplicitDatabase(t *testing.T) {
+func TestPostgresListenerFromSync_ExplicitDatabase(t *testing.T) {
 	raw := json.RawMessage(`[{"id":"pgs_1","foreign_id":"pg-analytics","database":"analytics","dsn":{"type":"env","var":"PG_DSN"}}]`)
 	getenv := mapEnv(map[string]string{
 		"IRON_PROXY_PG_LISTEN":                       "127.0.0.1:0",
@@ -87,15 +86,15 @@ func TestPostgresListenersFromSync_ExplicitDatabase(t *testing.T) {
 		"IRON_PROXY_PG_PG_ANALYTICS_CLIENT_PASSWORD": "pw",
 	})
 
-	listeners, ok := postgresListenersFromSync(nil, getenv, discardLogger(), raw)
+	listener, ok := postgresListenerFromSync(nil, getenv, discardLogger(), raw)
 	require.True(t, ok)
-	require.Len(t, listeners, 1)
+	require.NotNil(t, listener)
 	// Routing key is the explicit database, not the foreign_id.
-	require.NotNil(t, listeners[0].Route("analytics"))
-	require.Nil(t, listeners[0].Route("pg-analytics"))
+	require.NotNil(t, listener.Route("analytics"))
+	require.Nil(t, listener.Route("pg-analytics"))
 }
 
-func TestPostgresListenersFromSync_NoRole(t *testing.T) {
+func TestPostgresListenerFromSync_NoRole(t *testing.T) {
 	raw := json.RawMessage(`[{"id":"pgs_1","foreign_id":"pgmain","dsn":{"type":"env","var":"PG_DSN"}}]`)
 	getenv := mapEnv(map[string]string{
 		"IRON_PROXY_PG_LISTEN":                 "127.0.0.1:0",
@@ -103,49 +102,83 @@ func TestPostgresListenersFromSync_NoRole(t *testing.T) {
 		"IRON_PROXY_PG_PGMAIN_CLIENT_PASSWORD": "pw",
 	})
 
-	listeners, ok := postgresListenersFromSync(nil, getenv, discardLogger(), raw)
+	listener, ok := postgresListenerFromSync(nil, getenv, discardLogger(), raw)
 	require.True(t, ok)
-	require.Len(t, listeners, 1)
-	require.Empty(t, listeners[0].Route("pgmain").Role(), "absent role must be a no-op")
+	require.NotNil(t, listener)
+	require.Empty(t, listener.Route("pgmain").Role(), "absent role must be a no-op")
 }
 
-func TestPostgresListenersFromSync_MissingCredsSkipsRoute(t *testing.T) {
+func TestPostgresListenerFromSync_MissingCredsSkipsRoute(t *testing.T) {
 	raw := json.RawMessage(`[{"id":"pgs_1","foreign_id":"pg-analytics","dsn":{"type":"env","var":"PG_DSN"}}]`)
 	logBuf := &bytes.Buffer{}
 	logger := slog.New(slog.NewTextHandler(logBuf, nil))
 
 	// IRON_PROXY_PG_LISTEN is set but client credentials are missing: the route
-	// is skipped, and with no usable routes no managed listener is added.
+	// is skipped, and with no usable routes no listener is built.
 	getenv := mapEnv(map[string]string{
 		"IRON_PROXY_PG_LISTEN": "127.0.0.1:0",
 	})
 
-	listeners, ok := postgresListenersFromSync(nil, getenv, logger, raw)
+	listener, ok := postgresListenerFromSync(nil, getenv, logger, raw)
 	require.True(t, ok)
-	require.Empty(t, listeners)
+	require.Nil(t, listener)
 	require.Contains(t, logBuf.String(), "skipping synced postgres route")
 }
 
-func TestPostgresListenersFromSync_NoListenEnvKeepsLocal(t *testing.T) {
-	local := localListener(t, "local-main", "appdb")
+func TestPostgresListenerFromSync_NoListenAddressDropsRoutes(t *testing.T) {
 	raw := json.RawMessage(`[{"id":"pgs_1","foreign_id":"pg-analytics","dsn":{"type":"env","var":"PG_DSN"}}]`)
 	logBuf := &bytes.Buffer{}
 	logger := slog.New(slog.NewTextHandler(logBuf, nil))
 
-	// Credentials present but IRON_PROXY_PG_LISTEN unset: no managed listener,
-	// local listeners preserved.
+	// Credentials present but no local listener and IRON_PROXY_PG_LISTEN unset:
+	// there is no address to bind, so the synced routes are dropped.
 	getenv := mapEnv(map[string]string{
 		"IRON_PROXY_PG_PG_ANALYTICS_CLIENT_USER":     "app",
 		"IRON_PROXY_PG_PG_ANALYTICS_CLIENT_PASSWORD": "pw",
 	})
 
-	listeners, ok := postgresListenersFromSync([]*postgres.Listener{local}, getenv, logger, raw)
+	listener, ok := postgresListenerFromSync(nil, getenv, logger, raw)
 	require.True(t, ok)
-	require.Equal(t, []*postgres.Listener{local}, listeners)
-	require.Contains(t, logBuf.String(), "IRON_PROXY_PG_LISTEN not set")
+	require.Nil(t, listener)
+	require.Contains(t, logBuf.String(), "no listen address")
 }
 
-func TestPostgresListenersFromSync_DuplicateDatabaseDropped(t *testing.T) {
+func TestPostgresListenerFromSync_MergesLocalAndSynced(t *testing.T) {
+	local := localListener(t, "appdb")
+	raw := json.RawMessage(`[{"id":"pgs_1","foreign_id":"pg-analytics","database":"analytics","dsn":{"type":"env","var":"PG_DSN"}}]`)
+	getenv := mapEnv(map[string]string{
+		// No IRON_PROXY_PG_LISTEN: the bind address comes from the local listener.
+		"IRON_PROXY_PG_PG_ANALYTICS_CLIENT_USER":     "app",
+		"IRON_PROXY_PG_PG_ANALYTICS_CLIENT_PASSWORD": "pw",
+	})
+
+	listener, ok := postgresListenerFromSync(local, getenv, discardLogger(), raw)
+	require.True(t, ok)
+	require.NotNil(t, listener)
+	require.Equal(t, local.Listen(), listener.Listen())
+	require.NotNil(t, listener.Route("appdb"), "local route preserved")
+	require.NotNil(t, listener.Route("analytics"), "synced route layered on")
+}
+
+func TestPostgresListenerFromSync_LocalWinsOnCollision(t *testing.T) {
+	local := localListener(t, "shared")
+	raw := json.RawMessage(`[{"id":"pgs_1","foreign_id":"pg-analytics","database":"shared","dsn":{"type":"env","var":"PG_DSN"}}]`)
+	logBuf := &bytes.Buffer{}
+	logger := slog.New(slog.NewTextHandler(logBuf, nil))
+	getenv := mapEnv(map[string]string{
+		"IRON_PROXY_PG_PG_ANALYTICS_CLIENT_USER":     "app",
+		"IRON_PROXY_PG_PG_ANALYTICS_CLIENT_PASSWORD": "pw",
+	})
+
+	listener, ok := postgresListenerFromSync(local, getenv, logger, raw)
+	require.True(t, ok)
+	require.NotNil(t, listener)
+	// The local route (user "u") wins over the synced one (user "app").
+	require.True(t, listener.Route("shared").VerifyClient("u", "p"))
+	require.Contains(t, logBuf.String(), "duplicate database")
+}
+
+func TestPostgresListenerFromSync_DuplicateSyncedDatabaseDropped(t *testing.T) {
 	raw := json.RawMessage(`[
 		{"id":"pgs_1","foreign_id":"a","database":"shared","dsn":{"type":"env","var":"PG_DSN"}},
 		{"id":"pgs_2","foreign_id":"b","database":"shared","dsn":{"type":"env","var":"PG_DSN"}}
@@ -160,32 +193,35 @@ func TestPostgresListenersFromSync_DuplicateDatabaseDropped(t *testing.T) {
 		"IRON_PROXY_PG_B_CLIENT_PASSWORD": "pw",
 	})
 
-	listeners, ok := postgresListenersFromSync(nil, getenv, logger, raw)
+	listener, ok := postgresListenerFromSync(nil, getenv, logger, raw)
 	require.True(t, ok)
-	require.Len(t, listeners, 1)
-	require.NotNil(t, listeners[0].Route("shared"))
+	require.NotNil(t, listener)
+	require.Len(t, listener.Routes(), 1)
+	require.NotNil(t, listener.Route("shared"))
 	require.Contains(t, logBuf.String(), "duplicate database")
 }
 
-func TestPostgresListenersFromSync_InvalidPayload(t *testing.T) {
+func TestPostgresListenerFromSync_InvalidPayload(t *testing.T) {
 	logBuf := &bytes.Buffer{}
 	logger := slog.New(slog.NewTextHandler(logBuf, nil))
 
-	listeners, ok := postgresListenersFromSync(nil, mapEnv(nil), logger, json.RawMessage(`{not an array`))
+	listener, ok := postgresListenerFromSync(nil, mapEnv(nil), logger, json.RawMessage(`{not an array`))
 	require.False(t, ok, "invalid payload must signal keep-current")
-	require.Nil(t, listeners)
+	require.Nil(t, listener)
 	require.Contains(t, logBuf.String(), "rejecting invalid postgres config")
 }
 
-func TestPostgresListenersFromSync_NullPayloadKeepsLocal(t *testing.T) {
-	local := localListener(t, "local-main", "appdb")
+func TestPostgresListenerFromSync_NullPayloadKeepsLocal(t *testing.T) {
+	local := localListener(t, "appdb")
 
-	listeners, ok := postgresListenersFromSync([]*postgres.Listener{local}, mapEnv(nil), discardLogger(), json.RawMessage("null"))
+	listener, ok := postgresListenerFromSync(local, mapEnv(nil), discardLogger(), json.RawMessage("null"))
 	require.True(t, ok)
-	require.Equal(t, []*postgres.Listener{local}, listeners)
+	require.NotNil(t, listener)
+	require.Equal(t, local.Listen(), listener.Listen())
+	require.NotNil(t, listener.Route("appdb"))
 }
 
-func TestApplyPostgresSync_ReloadsListeners(t *testing.T) {
+func TestApplyPostgresSync_ReloadsListener(t *testing.T) {
 	mgr := postgres.NewManager(discardLogger())
 	t.Cleanup(func() { _ = mgr.Shutdown(context.Background()) })
 
@@ -197,7 +233,7 @@ func TestApplyPostgresSync_ReloadsListeners(t *testing.T) {
 	})
 
 	applyPostgresSync(context.Background(), mgr, nil, getenv, discardLogger(), raw)
-	require.Equal(t, []string{managedPgListenerName}, mgr.Names())
+	require.True(t, mgr.Running())
 }
 
 var _ secrets.Source = staticSource{}

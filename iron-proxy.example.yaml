@@ -650,44 +650,42 @@ transforms:
 # CancelRequest is not forwarded; one shared client credential per route
 # (no per-user).
 #
-# The postgres key is a list of listeners, and each listener fronts a list of
-# routes. A single listen address can serve many upstream databases: the
-# client selects a route by the database name it sends in its startup message
-# (psql's `dbname=`), and the proxy authenticates that connection against the
-# route's own credentials before dialing the route's upstream. A client that
-# requests a database with no matching route is rejected. The database name is
-# only a routing key — the upstream database is whatever the route's DSN names.
-# The top-level list still permits more than one listener (e.g. a separate
-# bind address per network segment); listener names must be unique.
+# The proxy runs a single postgres listener: the postgres key is one object
+# with a bind address and a list of routes. A single listen address serves many
+# upstream databases. The client selects a route by the database name it sends
+# in its startup message (psql's `dbname=`), and the proxy authenticates that
+# connection against the route's own credentials before dialing the route's
+# upstream. The client must name a database explicitly; a database with no
+# matching route is rejected. The database name is only a routing key: the
+# upstream database is whatever the route's DSN names.
 # postgres:
-#   - name: main
-#     listen: ":5432"
-#     routes:
-#       # Clients connect with dbname=appdb to reach this upstream.
-#       - database: appdb
-#         upstream:
-#           # The DSN is loaded from any registered secret source and passed
-#           # verbatim to pgconn. URL or keyword/value form both work.
-#           dsn:
-#             type: env
-#             var: PG_APPDB_DSN
-#         client:
-#           # The user/password clients must present for this route.
-#           user: app_user
-#           password_env: PG_APPDB_PROXY_PASSWORD
-#         # The Postgres role the proxy SETs at session start. Every query the
-#         # client issues runs as this role on the upstream database.
-#         role: tenant_role
-#       # Clients connect with dbname=analyticsdb to reach this upstream.
-#       - database: analyticsdb
-#         upstream:
-#           dsn:
-#             type: env
-#             var: PG_ANALYTICS_DSN
-#         client:
-#           user: analytics_user
-#           password_env: PG_ANALYTICS_PROXY_PASSWORD
-#         role: analytics_role
+#   listen: ":5432"
+#   routes:
+#     # Clients connect with dbname=appdb to reach this upstream.
+#     - database: appdb
+#       upstream:
+#         # The DSN is loaded from any registered secret source and passed
+#         # verbatim to pgconn. URL or keyword/value form both work.
+#         dsn:
+#           type: env
+#           var: PG_APPDB_DSN
+#       client:
+#         # The user/password clients must present for this route.
+#         user: app_user
+#         password_env: PG_APPDB_PROXY_PASSWORD
+#       # The Postgres role the proxy SETs at session start. Every query the
+#       # client issues runs as this role on the upstream database.
+#       role: tenant_role
+#     # Clients connect with dbname=analyticsdb to reach this upstream.
+#     - database: analyticsdb
+#       upstream:
+#         dsn:
+#           type: env
+#           var: PG_ANALYTICS_DSN
+#       client:
+#         user: analytics_user
+#         password_env: PG_ANALYTICS_PROXY_PASSWORD
+#       role: analytics_role
 
 # Optional management API. When `listen` is empty (default), the management
 # server is disabled. When set, the proxy serves an authenticated

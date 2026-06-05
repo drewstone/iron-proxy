@@ -42,88 +42,74 @@ func TestCompile(t *testing.T) {
 	}
 
 	t.Run("valid single listener many routes", func(t *testing.T) {
-		listeners, err := Compile([]ListenerConfig{{
-			Name:   "main",
+		l, err := Compile(ListenerConfig{
 			Listen: "127.0.0.1:0",
 			Routes: []RouteConfig{route("analytics"), route("reporting")},
-		}}, logger, stubSource)
+		}, logger, stubSource)
 		require.NoError(t, err)
-		require.Len(t, listeners, 1)
-		require.Equal(t, "main", listeners[0].Name())
-		require.Equal(t, "analytics", listeners[0].Route("analytics").Database())
-		require.Equal(t, "reporting", listeners[0].Route("reporting").Database())
-		require.Nil(t, listeners[0].Route("missing"))
-		require.True(t, listeners[0].Route("analytics").VerifyClient("u", "secret"))
+		require.NotNil(t, l)
+		require.Equal(t, "127.0.0.1:0", l.Listen())
+		require.Equal(t, "analytics", l.Route("analytics").Database())
+		require.Equal(t, "reporting", l.Route("reporting").Database())
+		require.Nil(t, l.Route("missing"))
+		require.True(t, l.Route("analytics").VerifyClient("u", "secret"))
 	})
 
-	t.Run("empty input is a no-op", func(t *testing.T) {
-		listeners, err := Compile(nil, logger, stubSource)
+	t.Run("empty block is a no-op", func(t *testing.T) {
+		l, err := Compile(ListenerConfig{}, logger, stubSource)
 		require.NoError(t, err)
-		require.Nil(t, listeners)
-	})
-
-	t.Run("name is required", func(t *testing.T) {
-		_, err := Compile([]ListenerConfig{{Listen: "127.0.0.1:0", Routes: []RouteConfig{route("a")}}}, logger, stubSource)
-		require.ErrorContains(t, err, "name is required")
+		require.Nil(t, l)
 	})
 
 	t.Run("listen is required", func(t *testing.T) {
-		_, err := Compile([]ListenerConfig{{Name: "main", Routes: []RouteConfig{route("a")}}}, logger, stubSource)
+		_, err := Compile(ListenerConfig{Routes: []RouteConfig{route("a")}}, logger, stubSource)
 		require.ErrorContains(t, err, "listen is required")
 	})
 
 	t.Run("at least one route is required", func(t *testing.T) {
-		_, err := Compile([]ListenerConfig{{Name: "main", Listen: "127.0.0.1:0"}}, logger, stubSource)
+		_, err := Compile(ListenerConfig{Listen: "127.0.0.1:0"}, logger, stubSource)
 		require.ErrorContains(t, err, "at least one route is required")
 	})
 
-	t.Run("duplicate listener name rejected", func(t *testing.T) {
-		l := ListenerConfig{Name: "main", Listen: "127.0.0.1:0", Routes: []RouteConfig{route("a")}}
-		_, err := Compile([]ListenerConfig{l, l}, logger, stubSource)
-		require.ErrorContains(t, err, "duplicate listener name")
-	})
-
 	t.Run("duplicate route database rejected", func(t *testing.T) {
-		_, err := Compile([]ListenerConfig{{
-			Name:   "main",
+		_, err := Compile(ListenerConfig{
 			Listen: "127.0.0.1:0",
 			Routes: []RouteConfig{route("dup"), route("dup")},
-		}}, logger, stubSource)
+		}, logger, stubSource)
 		require.ErrorContains(t, err, `duplicate route database "dup"`)
 	})
 
 	t.Run("route database is required", func(t *testing.T) {
-		_, err := Compile([]ListenerConfig{{
-			Name:   "main",
+		_, err := Compile(ListenerConfig{
 			Listen: "127.0.0.1:0",
 			Routes: []RouteConfig{route("")},
-		}}, logger, stubSource)
+		}, logger, stubSource)
 		require.ErrorContains(t, err, "database is required")
 	})
 
 	t.Run("route upstream dsn is required", func(t *testing.T) {
 		r := route("a")
 		r.Upstream.DSN = yaml.Node{}
-		_, err := Compile([]ListenerConfig{{Name: "main", Listen: "127.0.0.1:0", Routes: []RouteConfig{r}}}, logger, stubSource)
+		_, err := Compile(ListenerConfig{Listen: "127.0.0.1:0", Routes: []RouteConfig{r}}, logger, stubSource)
 		require.ErrorContains(t, err, "upstream.dsn is required")
 	})
 
 	t.Run("route client fields required", func(t *testing.T) {
 		r := route("a")
 		r.Client.User = ""
-		_, err := Compile([]ListenerConfig{{Name: "main", Listen: "127.0.0.1:0", Routes: []RouteConfig{r}}}, logger, stubSource)
+		_, err := Compile(ListenerConfig{Listen: "127.0.0.1:0", Routes: []RouteConfig{r}}, logger, stubSource)
 		require.ErrorContains(t, err, "client.user is required")
 
 		r = route("a")
 		r.Client.PasswordEnv = ""
-		_, err = Compile([]ListenerConfig{{Name: "main", Listen: "127.0.0.1:0", Routes: []RouteConfig{r}}}, logger, stubSource)
+		_, err = Compile(ListenerConfig{Listen: "127.0.0.1:0", Routes: []RouteConfig{r}}, logger, stubSource)
 		require.ErrorContains(t, err, "client.password_env is required")
 	})
 
 	t.Run("unset password env rejected", func(t *testing.T) {
 		r := route("a")
 		r.Client.PasswordEnv = "PG_PW_UNSET"
-		_, err := Compile([]ListenerConfig{{Name: "main", Listen: "127.0.0.1:0", Routes: []RouteConfig{r}}}, logger, stubSource)
+		_, err := Compile(ListenerConfig{Listen: "127.0.0.1:0", Routes: []RouteConfig{r}}, logger, stubSource)
 		require.ErrorContains(t, err, "is not set in the environment")
 	})
 }
