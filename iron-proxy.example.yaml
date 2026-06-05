@@ -656,8 +656,10 @@ transforms:
 # it sends in its startup message (psql's `dbname=`), and the proxy
 # authenticates that connection against the upstream's own credentials before
 # dialing it. The client must name a database explicitly; a database with no
-# matching upstream is rejected. The database name is only a routing key: the
-# upstream database is whatever the upstream's DSN names.
+# matching upstream is rejected. Each upstream's `database` must equal the
+# database its DSN connects to (the dbname in the DSN) — otherwise the client
+# would land on a different database than the one it named, and the proxy
+# rejects the connection.
 # postgres:
 #   listen: ":5432"
 #   upstreams:

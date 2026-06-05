@@ -14,10 +14,9 @@ tls:
 postgres:
   listen: "127.0.0.1:0"
   upstreams:
-    # Both upstreams front the same physical database (appdb) but inject a
-    # different role. The client picks the upstream by the database name it
-    # requests; the upstream database is whatever the DSN names.
-    - database: tenant
+    # Two upstreams routing to two distinct databases, each injecting its own
+    # role. Each upstream's database must match the database its DSN connects to.
+    - database: appdb
       dsn:
         type: env
         var: PG_UPSTREAM_DSN
@@ -26,14 +25,26 @@ postgres:
         password_env: PG_PROXY_PASSWORD
       role: tenant_role
 
-    - database: other
+    - database: otherdb
+      dsn:
+        type: env
+        var: PG_OTHER_DSN
+      client:
+        user: app_user
+        password_env: PG_PROXY_PASSWORD
+      role: other_role
+
+    # Deliberately misconfigured: the routing database "mismatch" does not match
+    # the DSN's database (appdb). The proxy must reject clients that connect to
+    # it rather than silently land them on appdb.
+    - database: mismatch
       dsn:
         type: env
         var: PG_UPSTREAM_DSN
       client:
         user: app_user
         password_env: PG_PROXY_PASSWORD
-      role: other_role
+      role: tenant_role
 
 metrics:
   listen: "127.0.0.1:0"

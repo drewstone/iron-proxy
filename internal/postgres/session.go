@@ -68,7 +68,14 @@ func runSession(ctx context.Context, clientConn net.Conn, listener *Listener, lo
 
 	upstreamConn, err := dialUpstream(ctx, upstream)
 	if err != nil {
-		writeFatal(backend, "08006", "upstream connection failed")
+		var mismatch *databaseMismatchError
+		if errors.As(err, &mismatch) {
+			// Configuration error, but surface it clearly to the client rather
+			// than as a generic connection failure.
+			writeFatal(backend, "3D000", mismatch.Error())
+		} else {
+			writeFatal(backend, "08006", "upstream connection failed")
+		}
 		logger.Error("postgres: upstream connect failed", slog.String("error", err.Error()))
 		return
 	}
@@ -138,8 +145,26 @@ func receiveStartup(rawConn net.Conn, backend *pgproto3.Backend) (*pgproto3.Star
 	return nil, errors.New("startup message preceded by too many SSL/GSS requests")
 }
 
+// databaseMismatchError reports that an upstream's routing database does not
+// match the database its DSN connects to. The two must always be equal: the
+// routing database is the name the client connected with, so if the upstream
+// session lands on a different database the client's view (current_database(),
+// search_path resolution, etc.) silently diverges from what it asked for.
+type databaseMismatchError struct {
+	configured string // the upstream's routing database (what the client requested)
+	dsn        string // the database the DSN actually connects to
+}
+
+func (e *databaseMismatchError) Error() string {
+	return fmt.Sprintf("upstream database mismatch: client connected to database %q but its DSN connects to %q; the route database and DSN database must match",
+		e.configured, e.dsn)
+}
+
 // dialUpstream opens an authenticated PgConn to the upstream database using
-// the DSN resolved from the upstream's configured secret source.
+// the DSN resolved from the upstream's configured secret source. It refuses to
+// connect when the DSN's database does not match the upstream's routing
+// database, since that would land the client on a different database than the
+// one it named.
 func dialUpstream(ctx context.Context, upstream *Upstream) (*pgconn.PgConn, error) {
 	dsn, err := upstream.DSN(ctx)
 	if err != nil {
@@ -148,6 +173,9 @@ func dialUpstream(ctx context.Context, upstream *Upstream) (*pgconn.PgConn, erro
 	cfg, err := pgconn.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parsing upstream DSN: %w", err)
+	}
+	if cfg.Database != upstream.Database() {
+		return nil, &databaseMismatchError{configured: upstream.Database(), dsn: cfg.Database}
 	}
 	conn, err := pgconn.ConnectConfig(ctx, cfg)
 	if err != nil {

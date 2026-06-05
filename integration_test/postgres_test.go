@@ -374,12 +374,12 @@ func TestPostgresPolicy(t *testing.T) {
 	})
 }
 
-// TestPostgresMultipleUpstreams boots one Postgres container and an iron-proxy
-// with a single postgres listener that fronts two upstreams — each keyed by a
-// distinct database name and configured with a different injected role. Both
-// upstreams share the same physical database; the client selects between them by
-// the database name it requests. Verifies each upstream enforces its own role
-// independently, including RLS scoping, and that an unknown database is
+// TestPostgresMultipleUpstreams boots one Postgres container (with two
+// databases) and an iron-proxy whose single listener fronts two upstreams —
+// each routing to a distinct database with its own injected role. The client
+// selects between them by the database name it requests. Verifies routing lands
+// on the right database and role, that an upstream whose DSN database does not
+// match its routing database is rejected, and that an unknown database is
 // rejected.
 func TestPostgresMultipleUpstreams(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -407,62 +407,75 @@ func TestPostgresMultipleUpstreams(t *testing.T) {
 
 	cfgPath := renderConfig(t, t.TempDir(), "postgres_multi_pipeline.yaml", nil)
 
-	upstreamDSN := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
-		pgUpstreamUser, pgUpstreamPass, upstreamHost, upstreamPort.Num(), pgUpstreamDB)
+	dsnFor := func(database string) string {
+		return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
+			pgUpstreamUser, pgUpstreamPass, upstreamHost, upstreamPort.Num(), database)
+	}
 	env := []string{
-		"PG_UPSTREAM_DSN=" + upstreamDSN,
+		"PG_UPSTREAM_DSN=" + dsnFor(pgUpstreamDB), // appdb
+		"PG_OTHER_DSN=" + dsnFor("otherdb"),
 		"PG_PROXY_PASSWORD=" + pgClientPassword,
 	}
 	proxy := startProxy(t, proxyBinary(t), cfgPath, env)
 
 	pgAddr := proxy.AddrFor(t, "postgres proxy starting")
 
-	// connStrTo selects an upstream by the database name in the DSN. Both
-	// live on the same listener; only the database differs.
+	// connStrTo selects an upstream by the database name the client requests.
+	// Every upstream lives on the same listener; only the database differs.
 	connStrTo := func(database string) string {
 		host, port, _ := net.SplitHostPort(pgAddr)
 		return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
 			pgClientUser, pgClientPassword, host, port, database)
 	}
 
-	queryRole := func(t *testing.T, database string) string {
+	queryScalar := func(t *testing.T, database, sql string) string {
 		t.Helper()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		conn, err := pgconn.Connect(ctx, connStrTo(database))
 		require.NoError(t, err)
 		defer func() { _ = conn.Close(context.Background()) }()
-		results, err := conn.Exec(ctx, "SELECT current_role").ReadAll()
+		results, err := conn.Exec(ctx, sql).ReadAll()
 		require.NoError(t, err)
 		require.Len(t, results, 1)
 		require.Len(t, results[0].Rows, 1)
 		return string(results[0].Rows[0][0])
 	}
 
-	t.Run("each upstream enforces its own role", func(t *testing.T) {
-		require.Equal(t, "tenant_role", queryRole(t, "tenant"))
-		require.Equal(t, "other_role", queryRole(t, "other"))
+	t.Run("each upstream routes to its own database and role", func(t *testing.T) {
+		require.Equal(t, "appdb", queryScalar(t, "appdb", "SELECT current_database()"))
+		require.Equal(t, "tenant_role", queryScalar(t, "appdb", "SELECT current_role"))
+
+		require.Equal(t, "otherdb", queryScalar(t, "otherdb", "SELECT current_database()"))
+		require.Equal(t, "other_role", queryScalar(t, "otherdb", "SELECT current_role"))
 	})
 
-	t.Run("rls scopes rows differently per upstream", func(t *testing.T) {
+	t.Run("role scopes rows via rls on the appdb upstream", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		// Through the tenant upstream: tenant_role sees only tenant_role's rows.
-		tenant, err := pgx.Connect(ctx, connStrTo("tenant"))
+		// The appdb upstream injects tenant_role, so RLS scopes the client to
+		// tenant_role's rows.
+		client, err := pgx.Connect(ctx, connStrTo("appdb"))
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = tenant.Close(ctx) })
-		var tenantCount int
-		require.NoError(t, tenant.QueryRow(ctx, "SELECT count(*) FROM items").Scan(&tenantCount))
-		require.Equal(t, 2, tenantCount, "tenant upstream should see only tenant_role's rows")
+		t.Cleanup(func() { _ = client.Close(ctx) })
+		var count int
+		require.NoError(t, client.QueryRow(ctx, "SELECT count(*) FROM items").Scan(&count))
+		require.Equal(t, 2, count, "appdb upstream should see only tenant_role's rows")
+	})
 
-		// Through the other upstream: other_role sees only other_role's rows.
-		other, err := pgx.Connect(ctx, connStrTo("other"))
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = other.Close(ctx) })
-		var otherCount int
-		require.NoError(t, other.QueryRow(ctx, "SELECT count(*) FROM items").Scan(&otherCount))
-		require.Equal(t, 3, otherCount, "other upstream should see only other_role's rows")
+	t.Run("database not matching the dsn is rejected", func(t *testing.T) {
+		// The "mismatch" upstream routes database "mismatch" to a DSN that
+		// connects to appdb. The proxy must refuse it rather than silently land
+		// the client on appdb.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := pgconn.Connect(ctx, connStrTo("mismatch"))
+		require.Error(t, err, "an upstream whose DSN database differs from its route database must be rejected")
+		var pgErr *pgconn.PgError
+		require.True(t, errors.As(err, &pgErr), "want PgError, got %T: %v", err, err)
+		require.Equal(t, "3D000", pgErr.Code)
+		require.Contains(t, pgErr.Message, "mismatch")
 	})
 
 	t.Run("unknown database is rejected", func(t *testing.T) {

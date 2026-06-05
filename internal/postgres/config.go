@@ -66,7 +66,10 @@ type ListenerConfig struct {
 // parameter.
 type UpstreamConfig struct {
 	// Database is the routing key: the database name a client must request to
-	// reach this upstream. Required and must be unique across upstreams.
+	// reach this upstream. Required and must be unique across upstreams. It must
+	// also equal the database the DSN connects to (the dbname in the DSN); the
+	// proxy rejects a connection whose upstream session would land on a
+	// different database than the client named.
 	Database string `yaml:"database"`
 
 	// DSN is the upstream connection string, loaded from any registered secret
