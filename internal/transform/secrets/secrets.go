@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"text/template"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -28,7 +29,11 @@ func init() {
 
 // secretsConfig is the YAML config structure.
 type secretsConfig struct {
-	Secrets []secretEntry `yaml:"secrets"`
+	Secrets []secretEntry  `yaml:"secrets"`
+	Pending []pendingEntry `yaml:"pending,omitempty"`
+	// PendingWait caps how long a request is held for a pending placeholder
+	// (Go duration; default 5s).
+	PendingWait string `yaml:"pending_wait,omitempty"`
 }
 
 type secretEntry struct {
@@ -130,7 +135,10 @@ var formatterFuncs = template.FuncMap{
 
 // Secrets is the transform that swaps proxy tokens for real secrets.
 type Secrets struct {
-	secrets []resolvedSecret
+	secrets     []resolvedSecret
+	pending     []resolvedPending
+	pendingWait time.Duration
+	logger      *slog.Logger
 }
 
 func factory(cfg yaml.Node, logger *slog.Logger) (transform.Transformer, error) {
@@ -138,7 +146,12 @@ func factory(cfg yaml.Node, logger *slog.Logger) (transform.Transformer, error) 
 	if err := cfg.Decode(&c); err != nil {
 		return nil, fmt.Errorf("parsing secrets config: %w", err)
 	}
-	return newFromConfig(c, defaultRegistry(logger))
+	s, err := newFromConfig(c, defaultRegistry(logger))
+	if err != nil {
+		return nil, err
+	}
+	s.logger = logger
+	return s, nil
 }
 
 // defaultRegistry returns the standard set of secret source builders. It is
@@ -258,7 +271,40 @@ func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets,
 		}
 	}
 
-	return &Secrets{secrets: resolved}, nil
+	wait := defaultPendingWait
+	if cfg.PendingWait != "" {
+		d, err := time.ParseDuration(cfg.PendingWait)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("pending_wait %q must be a positive duration", cfg.PendingWait)
+		}
+		wait = d
+	}
+	// A placeholder that has a secret now is not pending, even when a stale
+	// pending entry names it.
+	installed := make(map[string]*resolvedSecret, len(resolved))
+	for i := range resolved {
+		if resolved[i].mode == "replace" {
+			installed[resolved[i].proxyValue] = &resolved[i]
+		}
+	}
+	pending := make([]resolvedPending, 0, len(cfg.Pending))
+	for i, entry := range cfg.Pending {
+		if _, ok := installed[entry.ProxyValue]; ok {
+			continue
+		}
+		p, err := compilePending(i, entry)
+		if err != nil {
+			return nil, err
+		}
+		pending = append(pending, p)
+	}
+	// Release requests held on the previous pipeline. Done last so a config
+	// that fails to build installs nothing.
+	for proxyValue, sec := range installed {
+		installPending(proxyValue, sec)
+	}
+
+	return &Secrets{secrets: resolved, pending: pending, pendingWait: wait, logger: slog.Default()}, nil
 }
 
 // normalizeEntry validates the entry and returns either a replaceConfig or injectConfig.
@@ -342,6 +388,13 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 	}
 	var swapped, injected []secretRecord
 	var unavailable []string
+
+	if len(s.pending) > 0 {
+		held, err := s.waitForPending(ctx, tctx, req)
+		if err != nil || held != nil {
+			return held, err
+		}
+	}
 
 	for _, sec := range s.secrets {
 		if !hostmatch.MatchAnyRule(sec.rules, req) {
