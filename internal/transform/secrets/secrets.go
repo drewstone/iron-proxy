@@ -49,6 +49,7 @@ type secretEntry struct {
 	MatchBody                 bool     `yaml:"match_body,omitempty"`
 	Require                   bool     `yaml:"require,omitempty"`
 	AllowConnectWithoutHeader bool     `yaml:"allow_connect_without_header,omitempty"`
+	TLSOnly                   bool     `yaml:"tls_only,omitempty"`
 }
 
 type replaceConfig struct {
@@ -59,6 +60,7 @@ type replaceConfig struct {
 	MatchQuery                bool     `yaml:"match_query,omitempty"`
 	Require                   bool     `yaml:"require,omitempty"`
 	AllowConnectWithoutHeader bool     `yaml:"allow_connect_without_header,omitempty"`
+	TLSOnly                   bool     `yaml:"tls_only,omitempty"`
 }
 
 type injectConfig struct {
@@ -84,6 +86,10 @@ type resolvedSecret struct {
 	matchQuery                bool
 	require                   bool
 	allowConnectWithoutHeader bool
+	// tlsOnly swaps only a request that arrived over TLS. A plaintext request
+	// to the same host keeps the placeholder, so the real value never crosses
+	// the network unencrypted.
+	tlsOnly bool
 
 	// inject mode fields
 	injectHeader     string
@@ -266,6 +272,7 @@ func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets,
 				matchQuery:                replace.MatchQuery,
 				require:                   replace.Require,
 				allowConnectWithoutHeader: replace.AllowConnectWithoutHeader,
+				tlsOnly:                   replace.TLSOnly,
 				rules:                     rules,
 			})
 		}
@@ -363,6 +370,7 @@ func normalizeEntry(i int, entry *secretEntry) (*replaceConfig, *injectConfig, e
 		MatchBody:                 entry.MatchBody,
 		Require:                   entry.Require,
 		AllowConnectWithoutHeader: entry.AllowConnectWithoutHeader,
+		TLSOnly:                   entry.TLSOnly,
 	}, nil, nil
 }
 
@@ -396,8 +404,16 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		}
 	}
 
+	var plaintextSkipped []string
+
 	for _, sec := range s.secrets {
 		if !hostmatch.MatchAnyRule(sec.rules, req) {
+			continue
+		}
+		// The SNI is set only for a request that arrived over TLS, directly or
+		// inside a CONNECT tunnel.
+		if sec.tlsOnly && tctx.SNI == "" {
+			plaintextSkipped = append(plaintextSkipped, sec.source.Name())
 			continue
 		}
 
@@ -459,6 +475,9 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 	}
 	if len(unavailable) > 0 {
 		tctx.Annotate("secret_unavailable", unavailable)
+	}
+	if len(plaintextSkipped) > 0 {
+		tctx.Annotate("secret_plaintext_skipped", plaintextSkipped)
 	}
 
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
