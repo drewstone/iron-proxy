@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
@@ -20,7 +22,7 @@ func init() {
 // Allowlist is a default-deny transform that checks request hosts, methods,
 // and paths against a set of rules.
 type Allowlist struct {
-	rules []hostmatch.Rule
+	rules []privateRule
 	warn  bool
 }
 
@@ -40,33 +42,27 @@ func factory(cfg yaml.Node, _ *slog.Logger) (transform.Transformer, error) {
 }
 
 func newFromConfig(cfg allowlistConfig) (*Allowlist, error) {
-	var rules []hostmatch.Rule
-
-	// Flat domains → rules with no method/path restrictions.
-	for _, d := range cfg.Domains {
-		m, err := hostmatch.New([]string{d}, nil)
+	configs := append([]hostmatch.RuleConfig(nil), cfg.Rules...)
+	for _, host := range cfg.Domains {
+		if host != "" {
+			configs = append(configs, hostmatch.RuleConfig{Host: host})
+		}
+	}
+	for _, cidr := range cfg.CIDRs {
+		configs = append(configs, hostmatch.RuleConfig{CIDR: cidr})
+	}
+	var rules []privateRule
+	for _, rule := range configs {
+		compiled, err := hostmatch.CompileRules([]hostmatch.RuleConfig{rule}, "allowlist")
 		if err != nil {
 			return nil, err
 		}
-		rules = append(rules, hostmatch.Rule{Matcher: m})
-	}
-
-	// Flat CIDRs → rules with no method/path restrictions.
-	for _, c := range cfg.CIDRs {
-		m, err := hostmatch.New(nil, []string{c})
+		next, err := compilePrivateRule(compiled[0], rule)
 		if err != nil {
 			return nil, err
 		}
-		rules = append(rules, hostmatch.Rule{Matcher: m})
+		rules = append(rules, next)
 	}
-
-	// Explicit rules with optional method/path restrictions.
-	compiled, err := hostmatch.CompileRules(cfg.Rules, "allowlist")
-	if err != nil {
-		return nil, err
-	}
-	rules = append(rules, compiled...)
-
 	return &Allowlist{rules: rules, warn: cfg.Warn}, nil
 }
 
@@ -79,7 +75,16 @@ func New(domains []string, cidrs []string) (*Allowlist, error) {
 func (a *Allowlist) Name() string { return "allowlist" }
 
 func (a *Allowlist) TransformRequest(_ context.Context, tctx *transform.TransformContext, req *http.Request) (*transform.TransformResult, error) {
-	if hostmatch.MatchAnyRule(a.rules, req) {
+	allowed := false
+	host := hostmatch.StripPort(req.Host)
+	authority := tctx.TunnelAdmission || tctx.Tunnel == nil || matchesTunnelAuthority(tctx.Tunnel.Target, req.Host, req.TLS != nil)
+	for _, rule := range a.rules {
+		if authority && ((tctx.TunnelAdmission && rule.MatchesHost(host)) || (!tctx.TunnelAdmission && rule.matchesHTTP(req, host))) {
+			allowed = true
+			break
+		}
+	}
+	if allowed {
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}
 	if a.warn {
@@ -87,6 +92,24 @@ func (a *Allowlist) TransformRequest(_ context.Context, tctx *transform.Transfor
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}
 	return &transform.TransformResult{Action: transform.ActionReject}, nil
+}
+
+func matchesTunnelAuthority(target, requestHost string, tls bool) bool {
+	targetHost, targetPort, err := net.SplitHostPort(target)
+	if err != nil {
+		return false
+	}
+	requestPort := "80"
+	if tls {
+		requestPort = "443"
+	}
+	if strings.Contains(requestHost, ":") {
+		requestHost, requestPort, err = net.SplitHostPort(requestHost)
+		if err != nil {
+			return false
+		}
+	}
+	return strings.EqualFold(targetHost, requestHost) && targetPort == requestPort
 }
 
 func (a *Allowlist) TransformResponse(_ context.Context, _ *transform.TransformContext, _ *http.Request, _ *http.Response) (*transform.TransformResult, error) {

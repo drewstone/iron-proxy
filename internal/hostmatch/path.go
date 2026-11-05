@@ -9,6 +9,10 @@ import (
 // match any path under that prefix (e.g. /v1/* matches /v1/models and /v1).
 // Other patterns use path.Match glob semantics.
 func MatchPath(pattern, reqPath string) bool {
+	// A scoped prefix must not admit a path an upstream can normalize outside it.
+	if reqPath != "/" && path.Clean(reqPath) != strings.TrimSuffix(reqPath, "/") {
+		return false
+	}
 	if strings.HasSuffix(pattern, "/*") {
 		prefix := pattern[:len(pattern)-1] // "/v1/"
 		base := pattern[:len(pattern)-2]   // "/v1"

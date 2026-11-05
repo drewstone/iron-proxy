@@ -2,9 +2,11 @@ package transform
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -74,7 +76,7 @@ func (p *Pipeline) ProcessRequest(ctx context.Context, tctx *TransformContext, r
 			if result.Response != nil {
 				return result.Response, nil
 			}
-			return forbiddenResponse(req), nil
+			return forbiddenResponse(req, t.Name()), nil
 		}
 	}
 	return nil, nil
@@ -112,7 +114,7 @@ func (p *Pipeline) ProcessResponse(ctx context.Context, tctx *TransformContext, 
 			if result.Response != nil {
 				return result.Response, nil
 			}
-			return forbiddenResponse(req), nil
+			return forbiddenResponse(req, t.Name()), nil
 		}
 	}
 	return resp, nil
@@ -125,17 +127,29 @@ func (p *Pipeline) EmitAudit(result *PipelineResult) {
 	}
 }
 
-func forbiddenResponse(req *http.Request) *http.Response {
+// forbiddenResponse names the refused host and the refusing transform, the
+// same pair the audit line records as host and rejected_by, so the sandbox
+// sees the cause in-band instead of a 403 identical to an upstream one.
+func forbiddenResponse(req *http.Request, policy string) *http.Response {
+	host := req.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	code, nextStep := "EGRESS_REQUEST_REFUSED", "The "+policy+" policy refused this request; box.egress.denials() lists every refusal."
+	if policy == "allowlist" {
+		code, nextStep = "EGRESS_DOMAIN_NOT_ALLOWED", "Add "+host+" to egressPolicy.allowDomains (box.egress.update); a listed host is refused only for a method or path outside its rule."
+	}
+	body, _ := json.Marshal(map[string]string{"code": code, "host": host, "policy": policy, "nextStep": nextStep})
 	return &http.Response{
 		StatusCode:    http.StatusForbidden,
 		Status:        "403 Forbidden",
 		Proto:         "HTTP/1.1",
 		ProtoMajor:    1,
 		ProtoMinor:    1,
-		Header:        http.Header{"Content-Type": {"text/plain"}},
-		Body:          http.NoBody,
+		Header:        http.Header{"Content-Type": {"application/json"}},
+		Body:          io.NopCloser(strings.NewReader(string(body))),
 		Request:       req,
-		ContentLength: 0,
+		ContentLength: int64(len(body)),
 	}
 }
 

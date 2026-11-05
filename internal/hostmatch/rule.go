@@ -8,10 +8,11 @@ import (
 
 // RuleConfig is the YAML-decoded form of a host/method/path matching rule.
 type RuleConfig struct {
-	Host    string   `yaml:"host,omitempty"`
-	CIDR    string   `yaml:"cidr,omitempty"`
-	Methods []string `yaml:"methods,omitempty"`
-	Paths   []string `yaml:"paths,omitempty"`
+	Host            string   `yaml:"host,omitempty"`
+	CIDR            string   `yaml:"cidr,omitempty"`
+	Methods         []string `yaml:"methods,omitempty"`
+	Paths           []string `yaml:"paths,omitempty"`
+	AllowPrivateIPs []string `yaml:"allow_private_ips,omitempty"`
 }
 
 // Rule is a compiled matching rule ready for use.
@@ -23,7 +24,7 @@ type Rule struct {
 
 // Matches returns true if the request matches this rule.
 func (r *Rule) Matches(host, method, path string) bool {
-	if !r.Matcher.Matches(host) {
+	if !r.MatchesHost(host) {
 		return false
 	}
 	if r.Methods != nil && !r.Methods[method] {
@@ -33,6 +34,11 @@ func (r *Rule) Matches(host, method, path string) bool {
 		return false
 	}
 	return true
+}
+
+// MatchesHost checks the destination alone, without HTTP request fields.
+func (r *Rule) MatchesHost(host string) bool {
+	return r.Matcher.Matches(host)
 }
 
 // CompileRules compiles a list of RuleConfigs into Rules.
@@ -66,15 +72,12 @@ func CompileRules(configs []RuleConfig, prefix string) ([]Rule, error) {
 			}
 		}
 
-		r := Rule{Matcher: m}
+		r := Rule{Matcher: m, Paths: append([]string(nil), rc.Paths...)}
 		if !isWildcard(rc.Methods) {
 			r.Methods = make(map[string]bool, len(rc.Methods))
 			for _, method := range rc.Methods {
 				r.Methods[strings.ToUpper(method)] = true
 			}
-		}
-		if len(rc.Paths) > 0 {
-			r.Paths = rc.Paths
 		}
 
 		rules = append(rules, r)

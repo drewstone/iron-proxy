@@ -17,7 +17,6 @@ import (
 
 const (
 	sniPeekTimeout     = 5 * time.Second
-	sniUpstreamDial    = 30 * time.Second
 	defaultSNIUpstream = "443"
 )
 
@@ -106,16 +105,11 @@ func (p *Proxy) serveSNIPassthrough(clientConn net.Conn) error {
 	// Dial upstream using the proxy's resolver so SNI → IP lookup goes via
 	// the configured upstream DNS (not the proxy's own intercepting server).
 	// The guard's DialControl rejects denied IPs after resolution.
-	dialer := &net.Dialer{
-		Timeout:  sniUpstreamDial,
-		Resolver: p.resolver,
-		Control:  p.guard.DialControl,
-	}
 	port := p.sniUpstreamPort
 	if port == "" {
 		port = defaultSNIUpstream
 	}
-	upstream, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(sni, port))
+	upstream, err := p.dialPrivate(ctx, "tcp", net.JoinHostPort(sni, port), req)
 	if err != nil {
 		result.Action = transform.ActionContinue
 		result.StatusCode = http.StatusBadGateway

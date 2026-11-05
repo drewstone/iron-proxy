@@ -54,3 +54,11 @@ func TestStripPort(t *testing.T) {
 		})
 	}
 }
+
+func TestMatchPathRejectsNonCanonicalRequest(t *testing.T) {
+	require.True(t, MatchPath("/v1/*", "/v1/chat"))
+	require.True(t, MatchPath("/v1/*", "/v1/"))
+	require.False(t, MatchPath("/v1/*", "/v1/../admin"))
+	require.False(t, MatchPath("/v1/*", "/v1/./admin"))
+	require.False(t, MatchPath("/v1/*", "/v1//admin"))
+}

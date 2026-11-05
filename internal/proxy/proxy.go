@@ -26,6 +26,7 @@ import (
 	"github.com/ironsh/iron-proxy/internal/mcpgateway"
 	"github.com/ironsh/iron-proxy/internal/responseretry"
 	"github.com/ironsh/iron-proxy/internal/transform"
+	"github.com/ironsh/iron-proxy/internal/transform/secrets"
 	"golang.org/x/net/http2"
 )
 
@@ -372,6 +373,14 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 	// Wrap request body for lazy buffering by transforms.
 	r.Body = transform.NewBufferedBody(r.Body, bodyLimits.MaxRequestBodyBytes)
 
+	var clientUpgrade *http.Request
+	if isWebSocketUpgrade(r) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "WebSocket upgrade requires GET", http.StatusBadRequest)
+			return
+		}
+		clientUpgrade = r.Clone(r.Context())
+	}
 	// Run request transforms
 	rejectResp, err := pl.ProcessRequest(r.Context(), tctx, r, &result.RequestTransforms)
 	// Copy any captured request body from the body_capture transform's side
@@ -429,9 +438,13 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 
 	// WebSocket upgrade: hijack and proxy bidirectionally
 	if isWebSocketUpgrade(r) {
+		if clientUpgrade == nil {
+			http.Error(w, "invalid WebSocket upgrade", http.StatusBadRequest)
+			return
+		}
 		result.Action = transform.ActionContinue
 		result.StatusCode = http.StatusSwitchingProtocols
-		p.handleWebSocket(w, r, scheme, host)
+		p.handleWebSocket(w, r, clientUpgrade, scheme, host, pl, tctx, result)
 		return
 	}
 
@@ -501,6 +514,13 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 		upstreamReq.ContentLength = r.ContentLength
 	}
 
+	if err := secrets.ValidateFinalDestination(upstreamReq); err != nil {
+		result.Action = transform.ActionReject
+		result.StatusCode = http.StatusForbidden
+		http.Error(w, "credential destination refused", http.StatusForbidden)
+		return
+	}
+
 	var replayBody []byte
 	replayable := false
 	responseRetryEnabled := p.responseRetryHandler != nil && responseRetryEligible(upstreamReq)
@@ -522,7 +542,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 		}
 	}
 
-	resp, err := p.doUpstream(upstreamReq)
+	resp, err := p.RoundTrip(upstreamReq)
 	if err != nil {
 		if markIfClientCancel(r, err, result) {
 			return
@@ -557,7 +577,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 				replayReq.Header.Set("Traceparent", decision.Traceparent)
 			}
 			replayStarted := time.Now()
-			resp, err = p.doUpstream(replayReq)
+			resp, err = p.RoundTrip(replayReq)
 			completionTraceparent := decision.Traceparent
 			if completionTraceparent == "" {
 				completionTraceparent = upstreamReq.Header.Get("Traceparent")
@@ -746,89 +766,6 @@ func sanitizeUpstreamHeaders(h http.Header) {
 	}
 }
 
-// handleWebSocket hijacks the client connection and proxies raw bytes
-// bidirectionally to the upstream WebSocket server.
-func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request, scheme, host string) {
-	// Dial the upstream
-	upstreamScheme := "ws"
-	if scheme == "https" {
-		upstreamScheme = "wss"
-	}
-
-	var upstreamConn net.Conn
-	var err error
-
-	upstreamHost := host
-	if _, _, splitErr := net.SplitHostPort(host); splitErr != nil {
-		if upstreamScheme == "wss" {
-			upstreamHost = host + ":443"
-		} else {
-			upstreamHost = host + ":80"
-		}
-	}
-
-	dialer := &net.Dialer{
-		Timeout:  30 * time.Second,
-		Resolver: p.resolver,
-		Control:  p.guard.DialControl,
-	}
-	if upstreamScheme == "wss" {
-		upstreamConn, err = tls.DialWithDialer(
-			dialer,
-			"tcp", upstreamHost,
-			&tls.Config{MinVersion: tls.VersionTLS12},
-		)
-	} else {
-		upstreamConn, err = dialer.DialContext(r.Context(), "tcp", upstreamHost)
-	}
-	if err != nil {
-		p.logger.Error("websocket upstream dial failed",
-			slog.String("host", host),
-			slog.String("error", err.Error()),
-		)
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
-	}
-
-	// Sanitize the inbound request headers before serializing the upgrade
-	// upstream so client-supplied Proxy-Authorization, hop-by-hop headers,
-	// and Connection-named tokens are not leaked. Re-set the upgrade
-	// headers explicitly with the proxy's own values.
-	sanitizeUpstreamHeaders(r.Header)
-	r.Header.Set("Connection", "Upgrade")
-	r.Header.Set("Upgrade", "websocket")
-
-	// Write the rewritten HTTP upgrade request to upstream
-	if writeErr := r.Write(upstreamConn); writeErr != nil {
-		p.logger.Error("websocket upstream write failed", slog.String("error", writeErr.Error()))
-		upstreamConn.Close()
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
-	}
-
-	// Hijack the client connection
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		p.logger.Error("websocket hijack not supported")
-		upstreamConn.Close()
-		http.Error(w, "websocket not supported", http.StatusInternalServerError)
-		return
-	}
-	clientConn, clientBuf, err := hj.Hijack()
-	if err != nil {
-		p.logger.Error("websocket hijack failed", slog.String("error", err.Error()))
-		upstreamConn.Close()
-		return
-	}
-
-	// Relay until either side closes or the proxy shuts down. The hijacked
-	// bufio.Reader may hold bytes already read from the client, so wrap the
-	// conn to drain it first.
-	proxyBidi(p.shutdownCtx, newPeekedConn(clientConn, clientBuf.Reader), upstreamConn, p.logger, "websocket")
-
-	p.logger.Debug("websocket connection closed", slog.String("host", host))
-}
-
 // isSSE detects a Server-Sent Events response.
 func isSSE(resp *http.Response) bool {
 	ct := resp.Header.Get("Content-Type")
@@ -837,7 +774,8 @@ func isSSE(resp *http.Response) bool {
 
 // streamSSE writes an SSE response with per-chunk flushing.
 func (p *Proxy) streamSSE(w http.ResponseWriter, resp *http.Response) {
-	copyHeaders(w.Header(), resp.Header)
+	copyResponseHeaders(w, resp)
+	defer writeTrailers(w, resp)
 	w.WriteHeader(resp.StatusCode)
 
 	reader := transform.RequireBufferedBody(resp.Body).StreamingReader()
@@ -870,7 +808,7 @@ func (p *Proxy) streamSSE(w http.ResponseWriter, resp *http.Response) {
 }
 
 func (p *Proxy) writeResponse(w http.ResponseWriter, resp *http.Response) {
-	copyHeaders(w.Header(), resp.Header)
+	copyResponseHeaders(w, resp)
 	// Forward upstream trailers (e.g. gRPC status) after the body.
 	defer writeTrailers(w, resp)
 	if buf, ok := resp.Body.(*transform.BufferedBody); ok {
@@ -878,7 +816,7 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, resp *http.Response) {
 		// from the buffered data. Otherwise preserve the upstream header
 		// as-is so clients that require Content-Length (e.g. Docker)
 		// work correctly.
-		if n := buf.Len(); n >= 0 {
+		if n := buf.Len(); n >= 0 && len(resp.Trailer) == 0 {
 			w.Header().Set("Content-Length", strconv.FormatInt(int64(n), 10))
 		}
 		w.WriteHeader(resp.StatusCode)
@@ -932,10 +870,6 @@ func buildTransport(resolver *net.Resolver, guard *dnsguard.Guard, responseHeade
 	}
 }
 
-func (p *Proxy) doUpstream(req *http.Request) (*http.Response, error) {
-	return p.transport.RoundTrip(req)
-}
-
 // markIfClientCancel records a client-initiated cancellation on result and
 // returns true; callers should then return without writing a 502. The wrapped
 // errors.Is on err catches transforms that report context.Canceled without
@@ -968,12 +902,24 @@ func copyHeaders(dst, src http.Header) {
 	}
 }
 
+// Declare known trailers before writing so HTTP/1 does not synthesize a fixed
+// Content-Length and silently discard a short response's trailing fields.
+func copyResponseHeaders(w http.ResponseWriter, resp *http.Response) {
+	copyHeaders(w.Header(), resp.Header)
+	if len(resp.Trailer) > 0 {
+		w.Header().Del("Content-Length")
+	}
+	for name := range resp.Trailer {
+		w.Header().Add("Trailer", secrets.MaskResponseText(resp.Request, name))
+	}
+}
+
 // writeTrailers forwards upstream response trailers (e.g. gRPC status) to the
 // client after the body, via the TrailerPrefix convention.
 func writeTrailers(w http.ResponseWriter, resp *http.Response) {
 	for k, vs := range resp.Trailer {
 		for _, v := range vs {
-			w.Header().Add(http.TrailerPrefix+k, v)
+			w.Header().Add(http.TrailerPrefix+secrets.MaskResponseText(resp.Request, k), secrets.MaskResponseText(resp.Request, v))
 		}
 	}
 }

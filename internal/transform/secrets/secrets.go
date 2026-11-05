@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"text/template"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -28,30 +29,44 @@ func init() {
 
 // secretsConfig is the YAML config structure.
 type secretsConfig struct {
-	Secrets []secretEntry `yaml:"secrets"`
+	Secrets []secretEntry  `yaml:"secrets"`
+	Pending []pendingEntry `yaml:"pending,omitempty"`
+	// PendingWait caps how long a request is held for a pending placeholder
+	// (Go duration; default 5s).
+	PendingWait string `yaml:"pending_wait,omitempty"`
 }
 
 type secretEntry struct {
-	Source  yaml.Node              `yaml:"source"`
-	Rules   []hostmatch.RuleConfig `yaml:"rules"`
-	Inject  *injectConfig          `yaml:"inject,omitempty"`
-	Replace *replaceConfig         `yaml:"replace,omitempty"`
+	Presentation *presentationConfig    `yaml:"presentation,omitempty"`
+	ExpiresAt    time.Time              `yaml:"expires_at,omitempty"`
+	Source       yaml.Node              `yaml:"source"`
+	Rules        []hostmatch.RuleConfig `yaml:"rules"`
+	Inject       *injectConfig          `yaml:"inject,omitempty"`
+	Replace      *replaceConfig         `yaml:"replace,omitempty"`
 
 	// Deprecated top-level fields for backwards compatibility.
 	// Users should migrate to the replace block.
-	ProxyValue   string   `yaml:"proxy_value,omitempty"`
-	MatchHeaders []string `yaml:"match_headers,omitempty"`
-	MatchBody    bool     `yaml:"match_body,omitempty"`
-	Require      bool     `yaml:"require,omitempty"`
+	ProxyValue                string   `yaml:"proxy_value,omitempty"`
+	MatchHeaders              []string `yaml:"match_headers,omitempty"`
+	MatchBody                 bool     `yaml:"match_body,omitempty"`
+	Require                   bool     `yaml:"require,omitempty"`
+	AllowConnectWithoutHeader bool     `yaml:"allow_connect_without_header,omitempty"`
+	TLSOnly                   bool     `yaml:"tls_only,omitempty"`
+	ScrubResponse             bool     `yaml:"scrub_response,omitempty"`
 }
 
 type replaceConfig struct {
-	ProxyValue   string   `yaml:"proxy_value"`
-	MatchHeaders []string `yaml:"match_headers,omitempty"`
-	MatchBody    bool     `yaml:"match_body,omitempty"`
-	MatchPath    bool     `yaml:"match_path,omitempty"`
-	MatchQuery   bool     `yaml:"match_query,omitempty"`
-	Require      bool     `yaml:"require,omitempty"`
+	Presentation              *presentationConfig `yaml:"-"`
+	ExpiresAt                 time.Time           `yaml:"-"`
+	ProxyValue                string              `yaml:"proxy_value"`
+	MatchHeaders              []string            `yaml:"match_headers,omitempty"`
+	MatchBody                 bool                `yaml:"match_body,omitempty"`
+	MatchPath                 bool                `yaml:"match_path,omitempty"`
+	MatchQuery                bool                `yaml:"match_query,omitempty"`
+	Require                   bool                `yaml:"require,omitempty"`
+	AllowConnectWithoutHeader bool                `yaml:"allow_connect_without_header,omitempty"`
+	TLSOnly                   bool                `yaml:"tls_only,omitempty"`
+	ScrubResponse             bool                `yaml:"scrub_response,omitempty"`
 }
 
 type injectConfig struct {
@@ -65,17 +80,28 @@ type injectConfig struct {
 
 // resolvedSecret is a secret ready for use after config parsing and source resolution.
 type resolvedSecret struct {
-	source secretSource
-	mode   string // "replace" or "inject"
-	rules  []hostmatch.Rule
+	presentation *presentationConfig
+	expiresAt    time.Time
+	source       secretSource
+	mode         string // "replace" or "inject"
+	rules        []hostmatch.Rule
 
 	// replace mode fields
-	proxyValue   string
-	matchHeaders []headerMatcher // empty = all headers
-	matchBody    bool
-	matchPath    bool
-	matchQuery   bool
-	require      bool
+	proxyValue                string
+	matchHeaders              []headerMatcher // empty = all headers
+	matchBody                 bool
+	matchPath                 bool
+	matchQuery                bool
+	require                   bool
+	allowConnectWithoutHeader bool
+	// tlsOnly swaps only a request that arrived over TLS. A plaintext request
+	// to the same host keeps the placeholder, so the real value never crosses
+	// the network unencrypted.
+	tlsOnly bool
+	// scrubResponse replaces the real value with proxyValue in every response
+	// to a request this secret applies to, so a host that reflects the
+	// request's credential cannot hand the value back to the caller.
+	scrubResponse bool
 
 	// inject mode fields
 	injectHeader     string
@@ -127,7 +153,10 @@ var formatterFuncs = template.FuncMap{
 
 // Secrets is the transform that swaps proxy tokens for real secrets.
 type Secrets struct {
-	secrets []resolvedSecret
+	secrets     []resolvedSecret
+	pending     []resolvedPending
+	pendingWait time.Duration
+	logger      *slog.Logger
 }
 
 func factory(cfg yaml.Node, logger *slog.Logger) (transform.Transformer, error) {
@@ -135,7 +164,12 @@ func factory(cfg yaml.Node, logger *slog.Logger) (transform.Transformer, error) 
 	if err := cfg.Decode(&c); err != nil {
 		return nil, fmt.Errorf("parsing secrets config: %w", err)
 	}
-	return newFromConfig(c, defaultRegistry(logger))
+	s, err := newFromConfig(c, defaultRegistry(logger))
+	if err != nil {
+		return nil, err
+	}
+	s.logger = logger
+	return s, nil
 }
 
 // defaultRegistry returns the standard set of secret source builders. It is
@@ -241,25 +275,67 @@ func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets,
 				return nil, err
 			}
 			resolved = append(resolved, resolvedSecret{
-				source:       source,
-				mode:         "replace",
-				proxyValue:   replace.ProxyValue,
-				matchHeaders: matchers,
-				matchBody:    replace.MatchBody,
-				matchPath:    replace.MatchPath,
-				matchQuery:   replace.MatchQuery,
-				require:      replace.Require,
-				rules:        rules,
+				source:                    source,
+				presentation:              replace.Presentation,
+				expiresAt:                 replace.ExpiresAt,
+				mode:                      "replace",
+				proxyValue:                replace.ProxyValue,
+				matchHeaders:              matchers,
+				matchBody:                 replace.MatchBody,
+				matchPath:                 replace.MatchPath,
+				matchQuery:                replace.MatchQuery,
+				require:                   replace.Require,
+				allowConnectWithoutHeader: replace.AllowConnectWithoutHeader,
+				tlsOnly:                   replace.TLSOnly,
+				scrubResponse:             replace.ScrubResponse,
+				rules:                     rules,
 			})
 		}
 	}
 
-	return &Secrets{secrets: resolved}, nil
+	wait := defaultPendingWait
+	if cfg.PendingWait != "" {
+		d, err := time.ParseDuration(cfg.PendingWait)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("pending_wait %q must be a positive duration", cfg.PendingWait)
+		}
+		wait = d
+	}
+	// A placeholder that has a secret now is not pending, even when a stale
+	// pending entry names it.
+	installed := make(map[string]*resolvedSecret, len(resolved))
+	for i := range resolved {
+		if resolved[i].mode == "replace" {
+			installed[resolved[i].proxyValue] = &resolved[i]
+		}
+	}
+	pending := make([]resolvedPending, 0, len(cfg.Pending))
+	for i, entry := range cfg.Pending {
+		if _, ok := installed[entry.ProxyValue]; ok {
+			continue
+		}
+		p, err := compilePending(i, entry)
+		if err != nil {
+			return nil, err
+		}
+		pending = append(pending, p)
+	}
+	// Release requests held on the previous pipeline. Done last so a config
+	// that fails to build installs nothing.
+	for proxyValue, sec := range installed {
+		installPending(proxyValue, sec)
+	}
+
+	return &Secrets{secrets: resolved, pending: pending, pendingWait: wait, logger: slog.Default()}, nil
 }
 
 // normalizeEntry validates the entry and returns either a replaceConfig or injectConfig.
 // It handles legacy top-level fields by normalizing them into a replaceConfig.
 func normalizeEntry(i int, entry *secretEntry) (*replaceConfig, *injectConfig, error) {
+	if entry.Presentation != nil || !entry.ExpiresAt.IsZero() {
+		replace, err := canonicalConfig(entry)
+		return replace, nil, err
+	}
 	hasLegacy := entry.ProxyValue != "" || len(entry.MatchHeaders) > 0 || entry.MatchBody || entry.Require
 	hasReplace := entry.Replace != nil
 	hasInject := entry.Inject != nil
@@ -308,10 +384,13 @@ func normalizeEntry(i int, entry *secretEntry) (*replaceConfig, *injectConfig, e
 		return nil, nil, fmt.Errorf("secrets[%d]: proxy_value is required", i)
 	}
 	return &replaceConfig{
-		ProxyValue:   entry.ProxyValue,
-		MatchHeaders: entry.MatchHeaders,
-		MatchBody:    entry.MatchBody,
-		Require:      entry.Require,
+		ProxyValue:                entry.ProxyValue,
+		MatchHeaders:              entry.MatchHeaders,
+		MatchBody:                 entry.MatchBody,
+		Require:                   entry.Require,
+		AllowConnectWithoutHeader: entry.AllowConnectWithoutHeader,
+		TLSOnly:                   entry.TLSOnly,
+		ScrubResponse:             entry.ScrubResponse,
 	}, nil, nil
 }
 
@@ -338,9 +417,39 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 	var swapped, injected []secretRecord
 	var unavailable []string
 
+	if len(s.pending) > 0 {
+		held, err := s.waitForPending(ctx, tctx, req)
+		if err != nil || held != nil {
+			return held, err
+		}
+	}
+
+	var plaintextSkipped []string
+
 	for _, sec := range s.secrets {
+		if sec.presentation != nil {
+			locations, err := sec.swapCanonical(ctx, tctx, req)
+			if err != nil {
+				tctx.Annotate("reject_reason", "canonical_secret_refused")
+				return &transform.TransformResult{Action: transform.ActionReject}, nil
+			}
+			if len(locations) > 0 {
+				swapped = append(swapped, secretRecord{Secret: sec.source.Name(), Locations: locations})
+			}
+			continue
+		}
 		if !hostmatch.MatchAnyRule(sec.rules, req) {
 			continue
+		}
+		if !sec.admits(tctx) {
+			plaintextSkipped = append(plaintextSkipped, sec.source.Name())
+			continue
+		}
+		if sec.scrubResponse {
+			// The response is read as text to remove the value, so the
+			// upstream must not compress it. net/http asks for gzip itself and
+			// decodes what comes back.
+			req.Header.Del("Accept-Encoding")
 		}
 
 		name := sec.source.Name()
@@ -355,6 +464,7 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 			continue
 		}
 
+		rememberScrub(req, &sec, realValue)
 		if sec.mode == "inject" {
 			locations, err := s.injectSecret(req, &sec, realValue)
 			if err != nil {
@@ -387,7 +497,7 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 
 		if len(locations) > 0 {
 			swapped = append(swapped, secretRecord{Secret: name, Locations: locations})
-		} else if sec.require {
+		} else if sec.require && !allowConnectWithoutHeader(req, &sec) {
 			tctx.Annotate("rejected", name)
 			return &transform.TransformResult{Action: transform.ActionReject}, nil
 		}
@@ -402,8 +512,31 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 	if len(unavailable) > 0 {
 		tctx.Annotate("secret_unavailable", unavailable)
 	}
+	if len(plaintextSkipped) > 0 {
+		tctx.Annotate("secret_plaintext_skipped", plaintextSkipped)
+	}
 
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
+}
+
+func allowConnectWithoutHeader(req *http.Request, sec *resolvedSecret) bool {
+	if !sec.allowConnectWithoutHeader || req.Method != http.MethodConnect || len(sec.matchHeaders) == 0 {
+		return false
+	}
+	for _, matcher := range sec.matchHeaders {
+		if matcher.re != nil {
+			for headerName := range req.Header {
+				if matcher.re.MatchString(http.CanonicalHeaderKey(headerName)) {
+					return false
+				}
+			}
+			continue
+		}
+		if len(req.Header.Values(matcher.name)) > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Secrets) injectSecret(req *http.Request, sec *resolvedSecret, realValue string) ([]string, error) {
@@ -437,8 +570,11 @@ func (s *Secrets) formatValue(sec *resolvedSecret, realValue string) (string, er
 	return buf.String(), nil
 }
 
-func (s *Secrets) TransformResponse(_ context.Context, _ *transform.TransformContext, _ *http.Request, _ *http.Response) (*transform.TransformResult, error) {
-	return &transform.TransformResult{Action: transform.ActionContinue}, nil
+// admits reports whether the secret may be used for a request in this
+// context. The SNI is set only for a request that arrived over TLS, directly
+// or inside a CONNECT tunnel.
+func (sec *resolvedSecret) admits(tctx *transform.TransformContext) bool {
+	return !sec.tlsOnly || tctx.SNI != ""
 }
 
 func (s *Secrets) swapHeaders(req *http.Request, sec *resolvedSecret, realValue string) []string {
