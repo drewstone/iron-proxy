@@ -50,6 +50,7 @@ type secretEntry struct {
 	Require                   bool     `yaml:"require,omitempty"`
 	AllowConnectWithoutHeader bool     `yaml:"allow_connect_without_header,omitempty"`
 	TLSOnly                   bool     `yaml:"tls_only,omitempty"`
+	ScrubResponse             bool     `yaml:"scrub_response,omitempty"`
 }
 
 type replaceConfig struct {
@@ -61,6 +62,7 @@ type replaceConfig struct {
 	Require                   bool     `yaml:"require,omitempty"`
 	AllowConnectWithoutHeader bool     `yaml:"allow_connect_without_header,omitempty"`
 	TLSOnly                   bool     `yaml:"tls_only,omitempty"`
+	ScrubResponse             bool     `yaml:"scrub_response,omitempty"`
 }
 
 type injectConfig struct {
@@ -90,6 +92,10 @@ type resolvedSecret struct {
 	// to the same host keeps the placeholder, so the real value never crosses
 	// the network unencrypted.
 	tlsOnly bool
+	// scrubResponse replaces the real value with proxyValue in every response
+	// to a request this secret applies to, so a host that reflects the
+	// request's credential cannot hand the value back to the caller.
+	scrubResponse bool
 
 	// inject mode fields
 	injectHeader     string
@@ -273,6 +279,7 @@ func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets,
 				require:                   replace.Require,
 				allowConnectWithoutHeader: replace.AllowConnectWithoutHeader,
 				tlsOnly:                   replace.TLSOnly,
+				scrubResponse:             replace.ScrubResponse,
 				rules:                     rules,
 			})
 		}
@@ -371,6 +378,7 @@ func normalizeEntry(i int, entry *secretEntry) (*replaceConfig, *injectConfig, e
 		Require:                   entry.Require,
 		AllowConnectWithoutHeader: entry.AllowConnectWithoutHeader,
 		TLSOnly:                   entry.TLSOnly,
+		ScrubResponse:             entry.ScrubResponse,
 	}, nil, nil
 }
 
@@ -410,11 +418,15 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		if !hostmatch.MatchAnyRule(sec.rules, req) {
 			continue
 		}
-		// The SNI is set only for a request that arrived over TLS, directly or
-		// inside a CONNECT tunnel.
-		if sec.tlsOnly && tctx.SNI == "" {
+		if !sec.admits(tctx) {
 			plaintextSkipped = append(plaintextSkipped, sec.source.Name())
 			continue
+		}
+		if sec.scrubResponse {
+			// The response is read as text to remove the value, so the
+			// upstream must not compress it. net/http asks for gzip itself and
+			// decodes what comes back.
+			req.Header.Del("Accept-Encoding")
 		}
 
 		name := sec.source.Name()
@@ -534,8 +546,11 @@ func (s *Secrets) formatValue(sec *resolvedSecret, realValue string) (string, er
 	return buf.String(), nil
 }
 
-func (s *Secrets) TransformResponse(_ context.Context, _ *transform.TransformContext, _ *http.Request, _ *http.Response) (*transform.TransformResult, error) {
-	return &transform.TransformResult{Action: transform.ActionContinue}, nil
+// admits reports whether the secret may be used for a request in this
+// context. The SNI is set only for a request that arrived over TLS, directly
+// or inside a CONNECT tunnel.
+func (sec *resolvedSecret) admits(tctx *transform.TransformContext) bool {
+	return !sec.tlsOnly || tctx.SNI != ""
 }
 
 func (s *Secrets) swapHeaders(req *http.Request, sec *resolvedSecret, realValue string) []string {
