@@ -37,10 +37,12 @@ type secretsConfig struct {
 }
 
 type secretEntry struct {
-	Source  yaml.Node              `yaml:"source"`
-	Rules   []hostmatch.RuleConfig `yaml:"rules"`
-	Inject  *injectConfig          `yaml:"inject,omitempty"`
-	Replace *replaceConfig         `yaml:"replace,omitempty"`
+	Presentation *presentationConfig    `yaml:"presentation,omitempty"`
+	ExpiresAt    time.Time              `yaml:"expires_at,omitempty"`
+	Source       yaml.Node              `yaml:"source"`
+	Rules        []hostmatch.RuleConfig `yaml:"rules"`
+	Inject       *injectConfig          `yaml:"inject,omitempty"`
+	Replace      *replaceConfig         `yaml:"replace,omitempty"`
 
 	// Deprecated top-level fields for backwards compatibility.
 	// Users should migrate to the replace block.
@@ -54,15 +56,17 @@ type secretEntry struct {
 }
 
 type replaceConfig struct {
-	ProxyValue                string   `yaml:"proxy_value"`
-	MatchHeaders              []string `yaml:"match_headers,omitempty"`
-	MatchBody                 bool     `yaml:"match_body,omitempty"`
-	MatchPath                 bool     `yaml:"match_path,omitempty"`
-	MatchQuery                bool     `yaml:"match_query,omitempty"`
-	Require                   bool     `yaml:"require,omitempty"`
-	AllowConnectWithoutHeader bool     `yaml:"allow_connect_without_header,omitempty"`
-	TLSOnly                   bool     `yaml:"tls_only,omitempty"`
-	ScrubResponse             bool     `yaml:"scrub_response,omitempty"`
+	Presentation              *presentationConfig `yaml:"-"`
+	ExpiresAt                 time.Time           `yaml:"-"`
+	ProxyValue                string              `yaml:"proxy_value"`
+	MatchHeaders              []string            `yaml:"match_headers,omitempty"`
+	MatchBody                 bool                `yaml:"match_body,omitempty"`
+	MatchPath                 bool                `yaml:"match_path,omitempty"`
+	MatchQuery                bool                `yaml:"match_query,omitempty"`
+	Require                   bool                `yaml:"require,omitempty"`
+	AllowConnectWithoutHeader bool                `yaml:"allow_connect_without_header,omitempty"`
+	TLSOnly                   bool                `yaml:"tls_only,omitempty"`
+	ScrubResponse             bool                `yaml:"scrub_response,omitempty"`
 }
 
 type injectConfig struct {
@@ -76,9 +80,11 @@ type injectConfig struct {
 
 // resolvedSecret is a secret ready for use after config parsing and source resolution.
 type resolvedSecret struct {
-	source secretSource
-	mode   string // "replace" or "inject"
-	rules  []hostmatch.Rule
+	presentation *presentationConfig
+	expiresAt    time.Time
+	source       secretSource
+	mode         string // "replace" or "inject"
+	rules        []hostmatch.Rule
 
 	// replace mode fields
 	proxyValue                string
@@ -270,6 +276,8 @@ func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets,
 			}
 			resolved = append(resolved, resolvedSecret{
 				source:                    source,
+				presentation:              replace.Presentation,
+				expiresAt:                 replace.ExpiresAt,
 				mode:                      "replace",
 				proxyValue:                replace.ProxyValue,
 				matchHeaders:              matchers,
@@ -324,6 +332,10 @@ func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets,
 // normalizeEntry validates the entry and returns either a replaceConfig or injectConfig.
 // It handles legacy top-level fields by normalizing them into a replaceConfig.
 func normalizeEntry(i int, entry *secretEntry) (*replaceConfig, *injectConfig, error) {
+	if entry.Presentation != nil || !entry.ExpiresAt.IsZero() {
+		replace, err := canonicalConfig(entry)
+		return replace, nil, err
+	}
 	hasLegacy := entry.ProxyValue != "" || len(entry.MatchHeaders) > 0 || entry.MatchBody || entry.Require
 	hasReplace := entry.Replace != nil
 	hasInject := entry.Inject != nil
@@ -415,6 +427,17 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 	var plaintextSkipped []string
 
 	for _, sec := range s.secrets {
+		if sec.presentation != nil {
+			locations, err := sec.swapCanonical(ctx, tctx, req)
+			if err != nil {
+				tctx.Annotate("reject_reason", "canonical_secret_refused")
+				return &transform.TransformResult{Action: transform.ActionReject}, nil
+			}
+			if len(locations) > 0 {
+				swapped = append(swapped, secretRecord{Secret: sec.source.Name(), Locations: locations})
+			}
+			continue
+		}
 		if !hostmatch.MatchAnyRule(sec.rules, req) {
 			continue
 		}
@@ -441,6 +464,7 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 			continue
 		}
 
+		rememberScrub(req, &sec, realValue)
 		if sec.mode == "inject" {
 			locations, err := s.injectSecret(req, &sec, realValue)
 			if err != nil {

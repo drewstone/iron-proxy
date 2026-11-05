@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"html"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
-	"github.com/ironsh/iron-proxy/internal/hostmatch"
 	"github.com/ironsh/iron-proxy/internal/transform"
 )
 
@@ -30,6 +32,19 @@ func scrubPairsFor(realValue, placeholder string) []scrubPair {
 		return nil
 	}
 	pairs := []scrubPair{{needle: []byte(realValue), repl: []byte(placeholder)}}
+	for _, encode := range []func(string) string{url.QueryEscape, url.PathEscape, html.EscapeString} {
+		pairs = append(pairs, scrubPair{needle: []byte(encode(realValue)), repl: []byte(encode(placeholder))})
+	}
+	for _, escapeHTML := range []bool{true, false} {
+		content := func(value string) []byte {
+			var out bytes.Buffer
+			encoder := json.NewEncoder(&out)
+			encoder.SetEscapeHTML(escapeHTML)
+			_ = encoder.Encode(value)
+			return out.Bytes()[1 : out.Len()-2]
+		}
+		pairs = append(pairs, scrubPair{needle: content(realValue), repl: content(placeholder)})
+	}
 	for pad := 0; pad < 3; pad++ {
 		needle := base64Fragment(realValue, pad)
 		repl := base64Fragment(placeholder, pad)
@@ -155,7 +170,12 @@ func (r *scrubReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func (r *scrubReader) Close() error { return r.closer.Close() }
+func (r *scrubReader) Close() error {
+	if r.closer != nil {
+		return r.closer.Close()
+	}
+	return nil
+}
 
 // TransformResponse removes the real value from a response to a request that
 // carried a secret with scrub_response set. A host that echoes its request
@@ -164,31 +184,20 @@ func (r *scrubReader) Close() error { return r.closer.Close() }
 // is scrubbed as it streams, so its length changes and the response is sent
 // chunked.
 func (s *Secrets) TransformResponse(ctx context.Context, tctx *transform.TransformContext, req *http.Request, resp *http.Response) (*transform.TransformResult, error) {
-	var pairs []scrubPair
-	var names []string
-	for i := range s.secrets {
-		sec := &s.secrets[i]
-		if sec.mode != "replace" || !sec.scrubResponse || !sec.admits(tctx) || !hostmatch.MatchAnyRule(sec.rules, req) {
-			continue
-		}
-		realValue, err := sec.source.Get(ctx)
-		if err != nil {
-			continue
-		}
-		pairs = append(pairs, scrubPairsFor(realValue, sec.proxyValue)...)
-		names = append(names, sec.source.Name())
+	state, _ := req.Context().Value(scrubContextKey{}).(*requestScrubs)
+	if state == nil {
+		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}
+	resp.Request = req
+	pairs, names := state.pairs, state.names
+
 	if len(pairs) == 0 {
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}
 	tctx.Annotate("secret_response_scrubbed", names)
 	scrub := newScrubber(pairs)
 
-	for name, values := range resp.Header {
-		for i, value := range values {
-			resp.Header[name][i] = scrub.text(value)
-		}
-	}
+	scrubHeaders(resp.Header, scrub)
 
 	if req.Method == http.MethodHead || resp.ContentLength == 0 ||
 		resp.StatusCode < 200 || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified {
@@ -229,4 +238,39 @@ func (s *Secrets) TransformResponse(ctx context.Context, tctx *transform.Transfo
 	resp.Header.Del("Content-Length")
 	resp.ContentLength = -1
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
+}
+
+func scrubHeaders(header http.Header, scrub *scrubber) {
+	masked := make(http.Header, len(header))
+	for name, values := range header {
+		for _, value := range values {
+			key := scrub.text(name)
+			masked[key] = append(masked[key], scrub.text(value))
+		}
+	}
+	clear(header)
+	for name, values := range masked {
+		header[name] = values
+	}
+}
+
+// MaskResponseText uses only this request's selected source values, including after rotation.
+func MaskResponseText(req *http.Request, value string) string {
+	if req == nil {
+		return value
+	}
+	state, _ := req.Context().Value(scrubContextKey{}).(*requestScrubs)
+	if state == nil {
+		return value
+	}
+	return newScrubber(state.pairs).text(value)
+}
+
+// MaskResponseReader preserves streaming and WebSocket message boundaries with bounded memory.
+func MaskResponseReader(req *http.Request, src io.Reader) io.Reader {
+	state, _ := req.Context().Value(scrubContextKey{}).(*requestScrubs)
+	if state == nil {
+		return src
+	}
+	return newScrubReader(src, nil, newScrubber(state.pairs))
 }

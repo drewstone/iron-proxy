@@ -181,13 +181,24 @@ func (s *Secrets) waitForPending(ctx context.Context, tctx *transform.TransformC
 			pendingSlots.Lock()
 			sec := p.slot.resolved
 			pendingSlots.Unlock()
-			value, err := sec.source.Get(ctx)
+			var locations []string
+			var err error
+			if sec.presentation != nil {
+				locations, err = sec.swapCanonical(ctx, tctx, req)
+			} else {
+				var value string
+				value, err = sec.source.Get(ctx)
+				if err == nil {
+					locations = s.swapHeaders(req, sec, value)
+					rememberScrub(req, sec, value)
+				}
+			}
 			if err != nil {
 				outcome = "unavailable"
 			} else {
-				locations := s.swapHeaders(req, sec, value)
 				tctx.Annotate("swapped", []map[string]any{{"secret": sec.source.Name(), "locations": locations}})
 			}
+
 		}
 		s.logger.Log(ctx, pendingLogLevel(outcome), "egress pending placeholder waited",
 			slog.String("sandboxId", p.sandboxID),

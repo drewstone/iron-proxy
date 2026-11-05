@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ironsh/iron-proxy/internal/certcache"
@@ -638,81 +639,61 @@ func dialSOCKS5(t *testing.T, tunnelAddr, target string) (net.Conn, *bufio.Reade
 	return conn, bufio.NewReader(conn)
 }
 
-// startWebSocketUpstream starts a raw TCP server that accepts a single
-// connection, answers the upgrade request with 101, then hands the
-// connection to serve. The connection is closed when serve returns.
-func startWebSocketUpstream(t *testing.T, serve func(conn net.Conn, br *bufio.Reader)) string {
+// startWebSocketUpstream starts a WebSocket server that hands each accepted
+// connection to serve and closes it, without a close frame, when serve returns.
+func startWebSocketUpstream(t *testing.T, serve func(ctx context.Context, c *websocket.Conn)) string {
 	t.Helper()
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = ln.Close() })
-
-	go func() {
-		conn, err := ln.Accept()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
-		defer conn.Close()
-
-		br := bufio.NewReader(conn)
-		if _, err := http.ReadRequest(br); err != nil {
-			return
-		}
-		_, err = io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\n"+
-			"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-		if err != nil {
-			return
-		}
-		serve(conn, br)
-	}()
-
-	return ln.Addr().String()
+		defer func() { _ = c.CloseNow() }()
+		serve(r.Context(), c)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.Listener.Addr().String()
 }
 
 // startWebSocketEchoUpstream is startWebSocketUpstream with an echo loop.
 func startWebSocketEchoUpstream(t *testing.T) string {
 	t.Helper()
-	return startWebSocketUpstream(t, func(conn net.Conn, br *bufio.Reader) {
-		_, _ = io.Copy(conn, br)
+	return startWebSocketUpstream(t, func(ctx context.Context, c *websocket.Conn) {
+		for {
+			typ, msg, err := c.Read(ctx)
+			if err != nil || c.Write(ctx, typ, msg) != nil {
+				return
+			}
+		}
 	})
 }
 
-// wsUpgrade sends a WebSocket upgrade request for target over conn and
-// verifies the 101 response, leaving br positioned at the relayed stream.
-func wsUpgrade(t *testing.T, conn net.Conn, br *bufio.Reader, target string) {
+// wsUpgrade completes a WebSocket handshake for target over conn, which is
+// already connected to the proxy.
+func wsUpgrade(t *testing.T, conn net.Conn, target string) *websocket.Conn {
 	t.Helper()
-
-	_, err := fmt.Fprintf(conn, "GET /ws HTTP/1.1\r\n"+
-		"Host: %s\r\n"+
-		"Upgrade: websocket\r\n"+
-		"Connection: Upgrade\r\n"+
-		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"+
-		"Sec-WebSocket-Version: 13\r\n\r\n",
-		target)
-	require.NoError(t, err)
-
-	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
-	resp, err := http.ReadResponse(br, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(context.Context, string, string) (net.Conn, error) { return conn, nil },
+	}}
+	c, resp, err := websocket.Dial(ctx, "ws://"+target+"/ws", &websocket.DialOptions{HTTPClient: client})
 	require.NoError(t, err)
 	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	t.Cleanup(func() { _ = c.CloseNow() })
+	return c
 }
 
-// wsUpgradeAndEcho upgrades via wsUpgrade, then checks that payload bytes
-// echo back.
-func wsUpgradeAndEcho(t *testing.T, conn net.Conn, br *bufio.Reader, target string) {
+// wsUpgradeAndEcho upgrades via wsUpgrade, then checks that a message echoes back.
+func wsUpgradeAndEcho(t *testing.T, conn net.Conn, target string) {
 	t.Helper()
-
-	wsUpgrade(t, conn, br, target)
-
-	_, err := conn.Write([]byte("hello websocket"))
+	c := wsUpgrade(t, conn, target)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, c.Write(ctx, websocket.MessageText, []byte("hello websocket")))
+	_, msg, err := c.Read(ctx)
 	require.NoError(t, err)
-
-	buf := make([]byte, 4096)
-	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
-	n, err := br.Read(buf)
-	require.NoError(t, err)
-	require.Equal(t, "hello websocket", string(buf[:n]))
+	require.Equal(t, "hello websocket", string(msg))
 }
 
 func TestTunnel_CONNECT_WebSocket(t *testing.T) {
@@ -732,7 +713,7 @@ func TestTunnel_CONNECT_WebSocket(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	wsUpgradeAndEcho(t, conn, br, target)
+	wsUpgradeAndEcho(t, conn, target)
 }
 
 func TestTunnel_SOCKS5_WebSocket(t *testing.T) {
@@ -779,7 +760,7 @@ func TestTunnel_SOCKS5_WebSocket(t *testing.T) {
 	require.Equal(t, byte(0x05), connectResp[0]) // version
 	require.Equal(t, byte(0x00), connectResp[1]) // success
 
-	wsUpgradeAndEcho(t, conn, bufio.NewReader(conn), target)
+	wsUpgradeAndEcho(t, conn, target)
 }
 
 // wsEntryPaths are the ways a client reaches the WebSocket relay with a
@@ -815,13 +796,15 @@ func TestWebSocket_UpstreamClosePropagatesToClient(t *testing.T) {
 	for _, path := range wsEntryPaths {
 		t.Run(path.name, func(t *testing.T) {
 			// Upstream hangs up right after the handshake.
-			target := startWebSocketUpstream(t, func(net.Conn, *bufio.Reader) {})
-			conn, br := path.open(t, target)
-			wsUpgrade(t, conn, br, target)
+			target := startWebSocketUpstream(t, func(context.Context, *websocket.Conn) {})
+			conn, _ := path.open(t, target)
+			c := wsUpgrade(t, conn, target)
 
-			require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
-			_, err := br.ReadByte()
-			require.ErrorIs(t, err, io.EOF)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _, err := c.Read(ctx)
+			require.Error(t, err)
+			require.NoError(t, ctx.Err(), "client must see the hang-up, not time out")
 		})
 	}
 }
@@ -832,23 +815,44 @@ func TestWebSocket_ClientClosePropagatesToUpstream(t *testing.T) {
 	for _, path := range wsEntryPaths {
 		t.Run(path.name, func(t *testing.T) {
 			upstreamRead := make(chan error, 1)
-			target := startWebSocketUpstream(t, func(conn net.Conn, br *bufio.Reader) {
-				_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-				_, err := br.ReadByte()
+			target := startWebSocketUpstream(t, func(ctx context.Context, c *websocket.Conn) {
+				ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				_, _, err := c.Read(ctx)
+				if ctx.Err() != nil {
+					err = ctx.Err()
+				}
 				upstreamRead <- err
 			})
-			conn, br := path.open(t, target)
-			wsUpgrade(t, conn, br, target)
+			conn, _ := path.open(t, target)
+			wsUpgrade(t, conn, target)
 
 			require.NoError(t, conn.Close())
 			select {
 			case err := <-upstreamRead:
-				require.ErrorIs(t, err, io.EOF)
-			case <-time.After(5 * time.Second):
+				require.Error(t, err)
+				require.NotErrorIs(t, err, context.DeadlineExceeded, "upstream must see the hang-up, not time out")
+			case <-time.After(6 * time.Second):
 				t.Fatal("upstream did not observe the client close")
 			}
 		})
 	}
+}
+
+// Proxy shutdown must end an idle relay: the hijacked connection is outside
+// the HTTP server's own shutdown.
+func TestWebSocket_ShutdownClosesRelay(t *testing.T) {
+	target := startWebSocketEchoUpstream(t)
+	p, tunnelAddr, _ := startTunnelProxy(t, nil)
+	conn, _ := dialCONNECT(t, tunnelAddr, target)
+	c := wsUpgrade(t, conn, target)
+
+	p.shutdownCancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, err := c.Read(ctx)
+	require.Error(t, err)
+	require.NoError(t, ctx.Err(), "the relay must close on shutdown, not idle until the client gives up")
 }
 
 // TestServeOneHTTPConn_HijackWaitsForHandler pins the contract that lets
