@@ -542,7 +542,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 		}
 	}
 
-	resp, err := p.doUpstream(upstreamReq)
+	resp, err := p.RoundTrip(upstreamReq)
 	if err != nil {
 		if markIfClientCancel(r, err, result) {
 			return
@@ -577,7 +577,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 				replayReq.Header.Set("Traceparent", decision.Traceparent)
 			}
 			replayStarted := time.Now()
-			resp, err = p.doUpstream(replayReq)
+			resp, err = p.RoundTrip(replayReq)
 			completionTraceparent := decision.Traceparent
 			if completionTraceparent == "" {
 				completionTraceparent = upstreamReq.Header.Get("Traceparent")
@@ -868,13 +868,6 @@ func buildTransport(resolver *net.Resolver, guard *dnsguard.Guard, responseHeade
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: responseHeaderTimeout,
 	}
-}
-
-func (p *Proxy) doUpstream(req *http.Request) (*http.Response, error) {
-	if err := secrets.ValidateFinalDestination(req); err != nil {
-		return nil, err
-	}
-	return p.transport.RoundTrip(req)
 }
 
 // markIfClientCancel records a client-initiated cancellation on result and

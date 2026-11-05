@@ -115,7 +115,7 @@ func (g *Guard) IsDenied(ip netip.Addr) bool {
 	if g == nil || len(g.prefixes) == 0 {
 		return false
 	}
-	ip = ip.Unmap()
+	ip = ip.Unmap().WithZone("")
 	for _, p := range g.prefixes {
 		if p.Contains(ip) {
 			return true
@@ -141,7 +141,7 @@ func (g *Guard) DialControl(_ string, address string, _ syscall.RawConn) error {
 	if err != nil {
 		return nil
 	}
-	addr = addr.Unmap()
+	addr = addr.Unmap().WithZone("")
 	for _, p := range g.prefixes {
 		if p.Contains(addr) {
 			return &DenyError{Address: host, Prefix: p}

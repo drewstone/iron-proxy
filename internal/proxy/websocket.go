@@ -37,7 +37,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request, clientRe
 		headers.Del(name)
 	}
 	upstream, response, err := websocket.Dial(r.Context(), target.String(), &websocket.DialOptions{
-		HTTPClient: &http.Client{Transport: p.transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, HTTPHeader: headers, Host: host, Subprotocols: protocols, CompressionMode: websocket.CompressionContextTakeover,
+		HTTPClient: &http.Client{Transport: p, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, HTTPHeader: headers, Host: host, Subprotocols: protocols, CompressionMode: websocket.CompressionContextTakeover,
 	})
 	if response == nil {
 		result.StatusCode = http.StatusBadGateway

@@ -22,7 +22,7 @@ func init() {
 // Allowlist is a default-deny transform that checks request hosts, methods,
 // and paths against a set of rules.
 type Allowlist struct {
-	rules []hostmatch.Rule
+	rules []privateRule
 	warn  bool
 }
 
@@ -42,33 +42,27 @@ func factory(cfg yaml.Node, _ *slog.Logger) (transform.Transformer, error) {
 }
 
 func newFromConfig(cfg allowlistConfig) (*Allowlist, error) {
-	var rules []hostmatch.Rule
-
-	// Flat domains → rules with no method/path restrictions.
-	for _, d := range cfg.Domains {
-		m, err := hostmatch.New([]string{d}, nil)
+	configs := append([]hostmatch.RuleConfig(nil), cfg.Rules...)
+	for _, host := range cfg.Domains {
+		if host != "" {
+			configs = append(configs, hostmatch.RuleConfig{Host: host})
+		}
+	}
+	for _, cidr := range cfg.CIDRs {
+		configs = append(configs, hostmatch.RuleConfig{CIDR: cidr})
+	}
+	var rules []privateRule
+	for _, rule := range configs {
+		compiled, err := hostmatch.CompileRules([]hostmatch.RuleConfig{rule}, "allowlist")
 		if err != nil {
 			return nil, err
 		}
-		rules = append(rules, hostmatch.Rule{Matcher: m})
-	}
-
-	// Flat CIDRs → rules with no method/path restrictions.
-	for _, c := range cfg.CIDRs {
-		m, err := hostmatch.New(nil, []string{c})
+		next, err := compilePrivateRule(compiled[0], rule)
 		if err != nil {
 			return nil, err
 		}
-		rules = append(rules, hostmatch.Rule{Matcher: m})
+		rules = append(rules, next)
 	}
-
-	// Explicit rules with optional method/path restrictions.
-	compiled, err := hostmatch.CompileRules(cfg.Rules, "allowlist")
-	if err != nil {
-		return nil, err
-	}
-	rules = append(rules, compiled...)
-
 	return &Allowlist{rules: rules, warn: cfg.Warn}, nil
 }
 
@@ -82,34 +76,12 @@ func (a *Allowlist) Name() string { return "allowlist" }
 
 func (a *Allowlist) TransformRequest(_ context.Context, tctx *transform.TransformContext, req *http.Request) (*transform.TransformResult, error) {
 	allowed := false
-	if tctx.TunnelAdmission {
-		// A CONNECT has no inner method or path. Admit the tunnel by host,
-		// then check each parsed HTTP request against the full rule.
-		host := hostmatch.StripPort(req.Host)
-		for i := range a.rules {
-			if a.rules[i].MatchesHost(host) {
-				allowed = true
-				break
-			}
-		}
-	} else {
-		host := hostmatch.StripPort(req.Host)
-		// Reject escaped and path-parameter forms for scoped rules. An upstream
-		// can decode or strip them again after the proxy checks the URL path.
-		ambiguousPath := strings.ContainsAny(req.URL.EscapedPath(), "%\\;")
-		tunnelAuthorityMatches := tctx.Tunnel == nil || matchesTunnelAuthority(tctx.Tunnel.Target, req.Host, req.TLS != nil)
-		for i := range a.rules {
-			rule := &a.rules[i]
-			if !tunnelAuthorityMatches {
-				continue
-			}
-			if rule.Paths != nil && ambiguousPath {
-				continue
-			}
-			if rule.Matches(host, req.Method, req.URL.Path) {
-				allowed = true
-				break
-			}
+	host := hostmatch.StripPort(req.Host)
+	authority := tctx.TunnelAdmission || tctx.Tunnel == nil || matchesTunnelAuthority(tctx.Tunnel.Target, req.Host, req.TLS != nil)
+	for _, rule := range a.rules {
+		if authority && ((tctx.TunnelAdmission && rule.MatchesHost(host)) || (!tctx.TunnelAdmission && rule.matchesHTTP(req, host))) {
+			allowed = true
+			break
 		}
 	}
 	if allowed {
