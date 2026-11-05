@@ -2,6 +2,7 @@ package allowlist
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -148,6 +149,93 @@ func TestAllowlist_MethodAllowed(t *testing.T) {
 	require.Equal(t, transform.ActionContinue, resultWithMethodAndPath(t, a, "api.openai.com", "GET", "/").Action)
 	require.Equal(t, transform.ActionContinue, resultWithMethodAndPath(t, a, "api.openai.com", "POST", "/").Action)
 	require.Equal(t, transform.ActionReject, resultWithMethodAndPath(t, a, "api.openai.com", "DELETE", "/").Action)
+}
+
+func TestAllowlist_TunnelAdmissionDoesNotAllowInnerConnect(t *testing.T) {
+	a, err := newFromConfig(allowlistConfig{
+		Rules: []hostmatch.RuleConfig{{
+			Host: "api.openai.com", Methods: []string{"POST"}, Paths: []string{"/v1/*"},
+		}},
+	})
+	require.NoError(t, err)
+
+	request := func(method, path string, tunnelAdmission bool, mode transform.Mode) transform.TransformAction {
+		req := httptest.NewRequest(method, "http://api.openai.com"+path, nil)
+		req.Host = "api.openai.com:443"
+		res, err := a.TransformRequest(context.Background(), &transform.TransformContext{
+			Mode: mode, TunnelAdmission: tunnelAdmission,
+		}, req)
+		require.NoError(t, err)
+		return res.Action
+	}
+
+	require.Equal(t, transform.ActionContinue, request("CONNECT", "/", true, transform.ModeMITM))
+	require.Equal(t, transform.ActionContinue, request("POST", "/v1/chat", false, transform.ModeMITM))
+	require.Equal(t, transform.ActionReject, request("GET", "/v1/chat", false, transform.ModeMITM))
+	require.Equal(t, transform.ActionReject, request("POST", "/admin", false, transform.ModeMITM))
+	require.Equal(t, transform.ActionReject, request("CONNECT", "/", false, transform.ModeMITM))
+	require.Equal(t, transform.ActionReject, request("CONNECT", "/", false, transform.ModeSNIOnly))
+}
+
+func TestAllowlist_UppercaseHostKeepsRequestRule(t *testing.T) {
+	a, err := newFromConfig(allowlistConfig{
+		Rules: []hostmatch.RuleConfig{{
+			Host: "api.openai.com", Methods: []string{"POST"}, Paths: []string{"/v1/*"},
+		}},
+	})
+	require.NoError(t, err)
+	request := func(method, path string) transform.TransformAction {
+		req := httptest.NewRequest(method, "http://API.OPENAI.COM"+path, nil)
+		req.Host = "API.OPENAI.COM"
+		res, err := a.TransformRequest(context.Background(), &transform.TransformContext{}, req)
+		require.NoError(t, err)
+		return res.Action
+	}
+	require.Equal(t, transform.ActionContinue, request("POST", "/v1/chat"))
+	require.Equal(t, transform.ActionReject, request("DELETE", "/admin"))
+}
+
+func TestAllowlist_ScopedRuleRejectsAmbiguousPath(t *testing.T) {
+	a, err := newFromConfig(allowlistConfig{
+		Rules: []hostmatch.RuleConfig{{
+			Host: "api.openai.com", Methods: []string{"POST"}, Paths: []string{"/v1/*"},
+		}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionContinue, resultWithMethodAndPath(t, a, "api.openai.com", "POST", "/v1/chat").Action)
+	for _, path := range []string{
+		"/v1/%63hat", "/v1/%252e%252e/admin", "/v1/%2e%2e/admin",
+		"/v1/%5c..%5cadmin", "/v1/chat;admin", "/v1/../admin",
+	} {
+		require.Equal(t, transform.ActionReject, resultWithMethodAndPath(t, a, "api.openai.com", "POST", path).Action, path)
+	}
+}
+
+func TestAllowlist_TunnelTargetMatchesInnerAuthority(t *testing.T) {
+	a, err := newFromConfig(allowlistConfig{
+		Rules: []hostmatch.RuleConfig{{
+			Host: "api.openai.com", Methods: []string{"POST"}, Paths: []string{"/v1/*"},
+		}},
+	})
+	require.NoError(t, err)
+	request := func(target, host string, useTLS bool) transform.TransformAction {
+		req := httptest.NewRequest("POST", "http://"+host+"/v1/chat", nil)
+		req.Host = host
+		if useTLS {
+			req.TLS = &tls.ConnectionState{}
+		}
+		res, err := a.TransformRequest(context.Background(), &transform.TransformContext{
+			Tunnel: &transform.TunnelInfo{Target: target},
+		}, req)
+		require.NoError(t, err)
+		return res.Action
+	}
+	require.Equal(t, transform.ActionContinue, request("api.openai.com:80", "api.openai.com", false))
+	require.Equal(t, transform.ActionContinue, request("API.OPENAI.COM:443", "api.openai.com", true))
+	require.Equal(t, transform.ActionReject, request("github.com:80", "api.openai.com", false))
+	require.Equal(t, transform.ActionReject, request("github.com:443", "api.openai.com", true))
+	require.Equal(t, transform.ActionReject, request("api.openai.com:443", "api.openai.com", false))
+	require.Equal(t, transform.ActionReject, request("api.openai.com:443", "api.openai.com:8443", true))
 }
 
 func TestAllowlist_MethodsCaseInsensitive(t *testing.T) {

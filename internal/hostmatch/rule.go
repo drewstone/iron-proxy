@@ -23,7 +23,7 @@ type Rule struct {
 
 // Matches returns true if the request matches this rule.
 func (r *Rule) Matches(host, method, path string) bool {
-	if !r.Matcher.Matches(host) {
+	if !r.MatchesHost(host) {
 		return false
 	}
 	if r.Methods != nil && !r.Methods[method] {
@@ -33,6 +33,11 @@ func (r *Rule) Matches(host, method, path string) bool {
 		return false
 	}
 	return true
+}
+
+// MatchesHost checks the destination alone, without HTTP request fields.
+func (r *Rule) MatchesHost(host string) bool {
+	return r.Matcher.Matches(host)
 }
 
 // CompileRules compiles a list of RuleConfigs into Rules.

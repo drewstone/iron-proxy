@@ -86,6 +86,8 @@ type TransformContext struct {
 	Logger     *slog.Logger
 	Mode       Mode
 	Tunnel     *TunnelInfo
+	// TunnelAdmission marks the synthetic CONNECT check before an HTTP request exists.
+	TunnelAdmission bool
 
 	// BodyCapture is the side channel a body_capture transform uses to
 	// communicate captured request body bytes out of the pipeline. The proxy

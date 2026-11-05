@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
@@ -79,7 +81,38 @@ func New(domains []string, cidrs []string) (*Allowlist, error) {
 func (a *Allowlist) Name() string { return "allowlist" }
 
 func (a *Allowlist) TransformRequest(_ context.Context, tctx *transform.TransformContext, req *http.Request) (*transform.TransformResult, error) {
-	if hostmatch.MatchAnyRule(a.rules, req) {
+	allowed := false
+	if tctx.TunnelAdmission {
+		// A CONNECT has no inner method or path. Admit the tunnel by host,
+		// then check each parsed HTTP request against the full rule.
+		host := hostmatch.StripPort(req.Host)
+		for i := range a.rules {
+			if a.rules[i].MatchesHost(host) {
+				allowed = true
+				break
+			}
+		}
+	} else {
+		host := hostmatch.StripPort(req.Host)
+		// Reject escaped and path-parameter forms for scoped rules. An upstream
+		// can decode or strip them again after the proxy checks the URL path.
+		ambiguousPath := strings.ContainsAny(req.URL.EscapedPath(), "%\\;")
+		tunnelAuthorityMatches := tctx.Tunnel == nil || matchesTunnelAuthority(tctx.Tunnel.Target, req.Host, req.TLS != nil)
+		for i := range a.rules {
+			rule := &a.rules[i]
+			if !tunnelAuthorityMatches {
+				continue
+			}
+			if rule.Paths != nil && ambiguousPath {
+				continue
+			}
+			if rule.Matches(host, req.Method, req.URL.Path) {
+				allowed = true
+				break
+			}
+		}
+	}
+	if allowed {
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}
 	if a.warn {
@@ -87,6 +120,24 @@ func (a *Allowlist) TransformRequest(_ context.Context, tctx *transform.Transfor
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}
 	return &transform.TransformResult{Action: transform.ActionReject}, nil
+}
+
+func matchesTunnelAuthority(target, requestHost string, tls bool) bool {
+	targetHost, targetPort, err := net.SplitHostPort(target)
+	if err != nil {
+		return false
+	}
+	requestPort := "80"
+	if tls {
+		requestPort = "443"
+	}
+	if strings.Contains(requestHost, ":") {
+		requestHost, requestPort, err = net.SplitHostPort(requestHost)
+		if err != nil {
+			return false
+		}
+	}
+	return strings.EqualFold(targetHost, requestHost) && targetPort == requestPort
 }
 
 func (a *Allowlist) TransformResponse(_ context.Context, _ *transform.TransformContext, _ *http.Request, _ *http.Response) (*transform.TransformResult, error) {

@@ -290,9 +290,10 @@ func (p *Proxy) tunnelTransformCheck(remoteAddr, target string, connectHeaders h
 	}
 
 	tctx := &transform.TransformContext{
-		Logger: p.logger,
-		SNI:    host,
-		Mode:   mode,
+		Logger:          p.logger,
+		SNI:             host,
+		Mode:            mode,
+		TunnelAdmission: mode == transform.ModeMITM,
 	}
 
 	result := &transform.PipelineResult{
