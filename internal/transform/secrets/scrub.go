@@ -36,12 +36,17 @@ import (
 //     all five (padded or not, since only the characters that depend on the
 //     value alone are matched), the reversed value and rot13.
 //
+// A response to a request that redeemed a canonical secret is also projected
+// by its media type: a model stream that splits the value across records is
+// matched in the decoded text of each lane, and a stream format that cannot
+// be projected is refused (semantic.go).
+//
 // Residual risk: the scrub catches reflection in these known encodings. A
 // declared host that applies any other reversible transform, such as
-// encryption, compression, splitting the value across responses or base64
-// wrapped across lines, returns the value in a form no scrub can recognise.
-// A declared host therefore sits inside the trust boundary: declare only
-// hosts trusted with the value itself.
+// encryption, compression, splitting the value across responses or fields
+// that are not one lane, or base64 wrapped across lines, returns the value in
+// a form no scrub can recognise. A declared host therefore sits inside the
+// trust boundary: declare only hosts trusted with the value itself.
 
 // minFragment is the shortest derived needle worth matching. A shorter run is
 // as likely to be ordinary text as part of an encoded secret.
@@ -753,11 +758,15 @@ func (s *scrubber) text(value string) string {
 // scrubReader scrubs a body as it streams. It delivers what it has as soon as
 // it can prove no match starts in it, so a stream that pauses is held back
 // only by the bytes that begin a match, bounded as scan states. Memory is one
-// 32 KiB read plus that held tail.
+// 32 KiB read plus that held tail. project is the scan, or for a protected
+// response the projection of its media type (semantic.go).
 type scrubReader struct {
 	src     io.Reader
 	closer  io.Closer
-	scrub   *scrubber
+	project func(dst, data []byte, final bool) ([]byte, int, error)
+	// strict sends the held tail only at a clean end of stream: a failed or
+	// refused protected stream drops it and ends with ErrResponseRefused.
+	strict  bool
 	chunk   []byte
 	pending []byte
 	out     []byte
@@ -767,7 +776,11 @@ type scrubReader struct {
 }
 
 func newScrubReader(src io.Reader, closer io.Closer, s *scrubber) *scrubReader {
-	return &scrubReader{src: src, closer: closer, scrub: s, chunk: make([]byte, 32<<10)}
+	scan := func(dst, data []byte, final bool) ([]byte, int, error) {
+		out, held := s.scan(dst, data, final)
+		return out, held, nil
+	}
+	return &scrubReader{src: src, closer: closer, project: scan, chunk: make([]byte, 32<<10)}
 }
 
 func (r *scrubReader) Read(p []byte) (int, error) {
@@ -777,7 +790,18 @@ func (r *scrubReader) Read(p []byte) (int, error) {
 		}
 		n, err := r.src.Read(r.chunk)
 		r.pending = append(r.pending, r.chunk[:n]...)
-		out, held := r.scrub.scan(r.out[:0], r.pending, err != nil)
+		if err != nil && err != io.EOF && r.strict {
+			// A protected body that fails to read ends as a refusal, which
+			// the proxy aborts, and drops what it holds; the cause is not
+			// passed on.
+			r.pending, r.done, r.err = nil, true, ErrResponseRefused
+			continue
+		}
+		out, held, refused := r.project(r.out[:0], r.pending, err != nil)
+		if refused != nil {
+			r.pending, r.done, r.err = nil, true, refused
+			continue
+		}
 		r.out, r.ready = out, out
 		r.pending = append(r.pending[:0], r.pending[len(r.pending)-held:]...)
 		if err != nil {
@@ -816,6 +840,10 @@ func (s *Secrets) TransformResponse(ctx context.Context, tctx *transform.Transfo
 	tctx.Annotate("secret_response_scrubbed", names)
 	scrub := newScrubber(pairs)
 
+	if len(state.canonical) > 0 && refuseCredentialHeaderNames(resp.Header, scrub, state.values) {
+		return refuseResponse(tctx, req, names, "response_header_name", "response header name cannot be checked for a held secret\n"), nil
+	}
+
 	scrubHeaders(resp.Header, scrub)
 
 	if req.Method == http.MethodHead || resp.ContentLength == 0 ||
@@ -826,23 +854,7 @@ func (s *Secrets) TransformResponse(ctx context.Context, tctx *transform.Transfo
 	// its Accept-Encoding removed, so net/http decodes gzip itself; any other
 	// encoding is a host that compresses unasked.
 	if encoding := resp.Header.Get("Content-Encoding"); encoding != "" && !strings.EqualFold(encoding, "identity") {
-		tctx.Annotate("rejected", names)
-		tctx.Annotate("reject_reason", "response_encoding")
-		message := []byte("response encoding cannot be checked for a held secret\n")
-		return &transform.TransformResult{
-			Action: transform.ActionReject,
-			Response: &http.Response{
-				StatusCode:    http.StatusBadGateway,
-				Status:        "502 Bad Gateway",
-				Proto:         "HTTP/1.1",
-				ProtoMajor:    1,
-				ProtoMinor:    1,
-				Header:        http.Header{"Content-Type": {"text/plain"}},
-				Body:          transform.NewBufferedBodyFromBytes(message),
-				ContentLength: int64(len(message)),
-				Request:       req,
-			},
-		}, nil
+		return refuseResponse(tctx, req, names, "response_encoding", "response encoding cannot be checked for a held secret\n"), nil
 	}
 
 	// Read the upstream stream directly: the buffered body would hold the
@@ -853,10 +865,42 @@ func (s *Secrets) TransformResponse(ctx context.Context, tctx *transform.Transfo
 	if closer == nil {
 		closer = body
 	}
-	resp.Body = transform.NewBufferedBody(newScrubReader(stream, closer, scrub), 0)
+	var reader *scrubReader
+	if len(state.canonical) == 0 {
+		reader = newScrubReader(stream, closer, scrub)
+	} else {
+		var mode string
+		reader, mode = protectedBody(resp, stream, closer, scrub)
+		tctx.Annotate("secret_response_mode", mode)
+		if reader == nil {
+			return refuseResponse(tctx, req, names, "response_mode", "response type cannot be checked for a held secret\n"), nil
+		}
+	}
+	resp.Body = transform.NewBufferedBody(reader, 0)
 	resp.Header.Del("Content-Length")
 	resp.ContentLength = -1
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
+}
+
+// refuseResponse replaces a response the scrub cannot check with a 502 that
+// carries none of it.
+func refuseResponse(tctx *transform.TransformContext, req *http.Request, names []string, reason, message string) *transform.TransformResult {
+	tctx.Annotate("rejected", names)
+	tctx.Annotate("reject_reason", reason)
+	return &transform.TransformResult{
+		Action: transform.ActionReject,
+		Response: &http.Response{
+			StatusCode:    http.StatusBadGateway,
+			Status:        "502 Bad Gateway",
+			Proto:         "HTTP/1.1",
+			ProtoMajor:    1,
+			ProtoMinor:    1,
+			Header:        http.Header{"Content-Type": {"text/plain"}},
+			Body:          transform.NewBufferedBodyFromBytes([]byte(message)),
+			ContentLength: int64(len(message)),
+			Request:       req,
+		},
+	}
 }
 
 func scrubHeaders(header http.Header, scrub *scrubber) {

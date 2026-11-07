@@ -641,7 +641,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 		ct := finalResp.Header.Get("Content-Type")
 		wrapped, err := mcpPolicy.WrapResponseBody(mcpServer, ct, finalResp.Body, mcpTrace)
 		if err != nil {
-			p.logger.Warn("mcp response wrap error", slog.String("error", err.Error()))
+			warnOrAbort(p.logger, "mcp response wrap error", err)
 		} else if wrapped != nil {
 			finalResp.Body = wrapped
 		}
@@ -783,7 +783,7 @@ func (p *Proxy) streamSSE(w http.ResponseWriter, resp *http.Response) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		if _, err := io.Copy(w, reader); err != nil {
-			p.logger.Warn("SSE copy error", slog.String("error", err.Error()))
+			warnOrAbort(p.logger, "SSE copy error", err)
 		}
 		return
 	}
@@ -800,11 +800,22 @@ func (p *Proxy) streamSSE(w http.ResponseWriter, resp *http.Response) {
 		}
 		if readErr != nil {
 			if readErr != io.EOF {
-				p.logger.Warn("SSE read error", slog.String("error", readErr.Error()))
+				warnOrAbort(p.logger, "SSE read error", readErr)
 			}
 			break
 		}
 	}
+}
+
+// warnOrAbort logs a body error, but ends the connection when the secrets
+// transform refused the rest of a protected body, so the client cannot take
+// the forwarded prefix for a whole response.
+func warnOrAbort(logger *slog.Logger, msg string, err error) {
+	if errors.Is(err, secrets.ErrResponseRefused) {
+		logger.Warn("protected response refused")
+		panic(http.ErrAbortHandler)
+	}
+	logger.Warn(msg, slog.String("error", err.Error()))
 }
 
 func (p *Proxy) writeResponse(w http.ResponseWriter, resp *http.Response) {
@@ -821,7 +832,7 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, resp *http.Response) {
 		}
 		w.WriteHeader(resp.StatusCode)
 		if _, err := io.Copy(w, buf.StreamingReader()); err != nil {
-			p.logger.Warn("response body copy error", slog.String("error", err.Error()))
+			warnOrAbort(p.logger, "response body copy error", err)
 		}
 	} else {
 		// Synthetic responses (e.g. reject) with plain bodies.

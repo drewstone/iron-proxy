@@ -278,6 +278,35 @@ type requestScrubs struct {
 	authority string
 	pairs     []scrubPair
 	names     []string
+	// values holds each canonical source value, used only to refuse a response
+	// header name that reflects one in the case-insensitive HTTP namespace.
+	values []string
+}
+
+// refuseCredentialHeaderNames reports a protected response whose header name
+// reflects a captured value. Go canonicalizes a response field name (the first
+// letter and each letter after a dash) before the case-sensitive value scrub
+// runs, so a lowercase credential used as a field name would otherwise pass;
+// names are matched case-insensitively here, while body and value matching
+// stays case sensitive. A name whose projection would collide with another
+// header's name, compared case-insensitively as HTTP names are and as the
+// forwarded header merges them, is refused too.
+func refuseCredentialHeaderNames(header http.Header, scrub *scrubber, values []string) bool {
+	projected := make(map[string]bool, len(header))
+	for name := range header {
+		lower := strings.ToLower(name)
+		for _, value := range values {
+			if len(value) >= minFragment && strings.Contains(lower, strings.ToLower(value)) {
+				return true
+			}
+		}
+		key := strings.ToLower(scrub.text(name))
+		if projected[key] {
+			return true
+		}
+		projected[key] = true
+	}
+	return false
 }
 
 func rememberScrub(req *http.Request, sec *resolvedSecret, value string) {
@@ -300,6 +329,7 @@ func rememberScrub(req *http.Request, sec *resolvedSecret, value string) {
 		state.canonical = append(state.canonical, sec)
 		state.authority = req.Host
 		state.pairs = append(pairs, state.pairs...)
+		state.values = append(state.values, value)
 	} else {
 		state.pairs = append(state.pairs, pairs...)
 	}
