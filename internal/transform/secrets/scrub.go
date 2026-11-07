@@ -2,6 +2,7 @@ package secrets
 
 import (
 	"context"
+	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
 	"io"
@@ -31,8 +32,9 @@ import (
 //     maxGap of them per gap are skipped and the whole span is replaced.
 //   - Transforms of the whole value, each matched through the escapes above:
 //     hex (either case), base64 in the standard and URL alphabets at all three
-//     alignments (padded or not, since only the characters that depend on
-//     the value alone are matched), the reversed value and rot13.
+//     alignments and base32 in the standard and hex alphabets (either case) at
+//     all five (padded or not, since only the characters that depend on the
+//     value alone are matched), the reversed value and rot13.
 //
 // Residual risk: the scrub catches reflection in these known encodings. A
 // declared host that applies any other reversible transform, such as
@@ -58,7 +60,7 @@ type scrubPair struct {
 	needle []byte
 	repl   []byte
 	// fold matches ASCII letters in either case and writes the replacement in
-	// the case the match used. Only hex sets it.
+	// the case the match used. Hex and base32 set it.
 	fold bool
 }
 
@@ -85,7 +87,13 @@ func scrubPairsFor(realValue, placeholder string) []scrubPair {
 	derived(rot13(realValue), rot13(placeholder), false)
 	for _, enc := range []*base64.Encoding{base64.RawStdEncoding, base64.RawURLEncoding} {
 		for pad := 0; pad < 3; pad++ {
-			derived(base64Fragment(enc, realValue, pad), base64Fragment(enc, placeholder, pad), false)
+			derived(fragment(enc.EncodeToString, 6, realValue, pad), fragment(enc.EncodeToString, 6, placeholder, pad), false)
+		}
+	}
+	for _, enc := range []*base32.Encoding{base32.StdEncoding, base32.HexEncoding} {
+		encode := func(b []byte) string { return strings.ToLower(enc.EncodeToString(b)) }
+		for pad := 0; pad < 5; pad++ {
+			derived(fragment(encode, 5, realValue, pad), fragment(encode, 5, placeholder, pad), true)
 		}
 	}
 	return pairs
@@ -109,15 +117,16 @@ func rot13(value string) string {
 	}, value)
 }
 
-// base64Fragment returns the base64 text that depends on value alone when pad
-// bytes of other data come before it in the stream. Base64 turns three bytes
-// into four characters, so the same value encodes three ways depending on
-// where it starts; the characters that also carry a neighbour's bits, and any
-// padding, are left out.
-func base64Fragment(enc *base64.Encoding, value string, pad int) string {
-	encoded := enc.EncodeToString(append(make([]byte, pad), value...))
-	start := (8*pad + 5) / 6
-	end := 8 * (pad + len(value)) / 6
+// fragment returns the text that depends on value alone when pad bytes of
+// other data come before it in a stream encoded at bits per character.
+// Base64 turns three bytes into four characters and base32 five into eight,
+// so the same value encodes differently depending on where it starts; the
+// characters that also carry a neighbour's bits, and any padding, are left
+// out.
+func fragment(encode func([]byte) string, bits int, value string, pad int) string {
+	encoded := encode(append(make([]byte, pad), value...))
+	start := (8*pad + bits - 1) / bits
+	end := 8 * (pad + len(value)) / bits
 	if end <= start {
 		return ""
 	}
@@ -163,13 +172,34 @@ type scrubber struct {
 	// start with it.
 	ascii [utf8.RuneSelf][]int
 	other map[rune][]int
-	// start marks the bytes that can begin a needle's first character.
+	// start marks the bytes that can begin a needle's first character, and
+	// pair the byte pairs that can begin a match, so most bytes are passed
+	// over without decoding.
 	start [256]bool
+	pair  [256][4]uint64
+}
+
+func (s *scrubber) setPair(b0, b1 byte) { s.pair[b0][b1>>6] |= 1 << (b1 & 63) }
+
+// setRow admits b0 followed by any byte.
+func (s *scrubber) setRow(b0 byte) {
+	s.pair[b0] = [4]uint64{^uint64(0), ^uint64(0), ^uint64(0), ^uint64(0)}
+}
+
+func (s *scrubber) mayStart(data []byte, i int) bool {
+	if i+1 == len(data) {
+		return s.start[data[i]]
+	}
+	b1 := data[i+1]
+	return s.pair[data[i]][b1>>6]&(1<<(b1&63)) != 0
 }
 
 func newScrubber(pairs []scrubPair) *scrubber {
 	s := &scrubber{other: map[rune][]int{}}
-	s.start['%'], s.start['\\'], s.start['&'] = true, true, true
+	for _, b := range []byte{'%', '\\', '&'} {
+		s.start[b] = true
+		s.setRow(b)
+	}
 	for _, p := range pairs {
 		n := needle{runes: decodeRunes(p.needle), repl: decodeRunes(p.repl), fold: p.fold}
 		if len(n.runes) == 0 {
@@ -183,12 +213,25 @@ func newScrubber(pairs []scrubPair) *scrubber {
 			heads = append(heads, unicode.ToUpper(n.runes[0]))
 		}
 		for _, head := range heads {
+			lead := appendRune(nil, head)[0]
 			if head < utf8.RuneSelf {
 				s.ascii[head] = append(s.ascii[head], index)
 			} else {
 				s.other[head] = append(s.other[head], index)
 			}
-			s.start[appendRune(nil, head)[0]] = true
+			s.start[lead] = true
+			if head >= utf8.RuneSelf || len(n.runes) == 1 || n.runes[1] >= utf8.RuneSelf {
+				s.setRow(lead)
+				continue
+			}
+			// The second character follows literally, escaped, or after a
+			// format character; the last two start with a non-letter byte.
+			for _, b1 := range []byte{byte(n.runes[1]), byte(unicode.ToUpper(n.runes[1])), '%', '\\', '&'} {
+				s.setPair(lead, b1)
+			}
+			for b1 := utf8.RuneSelf; b1 < 256; b1++ {
+				s.setPair(lead, byte(b1))
+			}
 		}
 	}
 	return s
@@ -636,7 +679,7 @@ func (s *scrubber) scan(dst, data []byte, final bool) (out []byte, held int) {
 	emitted := 0
 	var spellings, best []spelling
 	for i := 0; i < len(data); i++ {
-		for i < len(data) && !s.start[data[i]] {
+		for i < len(data) && !s.mayStart(data, i) {
 			i++
 		}
 		if i == len(data) {
@@ -651,7 +694,10 @@ func (s *scrubber) scan(dst, data []byte, final bool) (out []byte, held int) {
 		}
 		for pass := 0; pass < passes; pass++ {
 			escaped := pass == 0
-			r, w, _, st := readToken(data[i:], escaped, final)
+			r, w, st := rune(data[i]), 1, tokenOK
+			if r >= utf8.RuneSelf || isEscapeStart(data[i]) {
+				r, w, _, st = readToken(data[i:], escaped, final)
+			}
 			if st == tokenMore {
 				more = true
 				continue

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -112,10 +113,10 @@ func rot13(value string) string {
 // middle is the part of a base64 text that depends on value alone when
 // prefix comes before it: the characters that also carry a neighbour's bits
 // change with the neighbour, so only the middle is a stable spelling.
-func middle(encoding *base64.Encoding, prefix string) func(string) string {
+func middle(encode func([]byte) string, bits int, prefix string) func(string) string {
 	return func(value string) string {
-		encoded := encoding.EncodeToString([]byte(prefix + value))
-		return encoded[(8*len(prefix)+5)/6 : 8*(len(prefix)+len(value))/6]
+		encoded := encode([]byte(prefix + value))
+		return encoded[(8*len(prefix)+bits-1)/bits : 8*(len(prefix)+len(value))/bits]
 	}
 }
 
@@ -175,8 +176,28 @@ func reflections() []reflection {
 				form: func(v string) string { return enc.encoding.EncodeToString([]byte(prefix + v)) },
 				// The scrub can only replace the characters that depend on the
 				// value alone, so that middle is what is asserted.
-				placeholder: middle(enc.encoding, prefix),
-				stable:      middle(enc.encoding, prefix),
+				placeholder: middle(enc.encoding.EncodeToString, 6, prefix),
+				stable:      middle(enc.encoding.EncodeToString, 6, prefix),
+			})
+		}
+	}
+	for _, enc := range []struct {
+		name   string
+		encode func([]byte) string
+	}{
+		{"base32", base32.StdEncoding.EncodeToString},
+		{"base32 lowercase", func(b []byte) string { return strings.ToLower(base32.StdEncoding.EncodeToString(b)) }},
+		{"base32hex", base32.HexEncoding.EncodeToString},
+		{"base32hex lowercase unpadded", func(b []byte) string {
+			return strings.ToLower(base32.HexEncoding.WithPadding(base32.NoPadding).EncodeToString(b))
+		}},
+	} {
+		for _, prefix := range []string{"", "u", "u:", "us:", "user"} {
+			rows = append(rows, reflection{
+				name:        fmt.Sprintf("%s after %q", enc.name, prefix),
+				form:        func(v string) string { return enc.encode([]byte(prefix + v)) },
+				placeholder: middle(enc.encode, 5, prefix),
+				stable:      middle(enc.encode, 5, prefix),
 			})
 		}
 	}
