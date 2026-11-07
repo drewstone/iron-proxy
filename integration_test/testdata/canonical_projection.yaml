@@ -1,0 +1,69 @@
+dns:
+  proxy_ip: "127.0.0.1"
+  listen: "127.0.0.1:0"
+
+proxy:
+  http_listen: "127.0.0.1:0"
+  https_listen: "127.0.0.1:0"
+  upstream_deny_cidrs: []
+
+tls:
+  ca_cert: "{{.CACert}}"
+  ca_key: "{{.CAKey}}"
+
+transforms:
+  - name: allowlist
+    config:
+      domains:
+        - "{{.Host}}"
+
+  - name: secrets
+    config:
+      secrets:
+        - source:
+            type: file
+            path: "{{.SourcePath}}"
+            ttl: 1ms
+          presentation:
+            type: bearer
+          proxy_value: "{{.Placeholder}}"
+          expires_at: {{.ExpiresAt}}
+          rules:
+            - host: "{{.Host}}"
+        # A numeric source, redeemed through two headers: one placeholder is
+        # itself a number, the other is not.
+        - source:
+            type: file
+            path: "{{.DigitsPath}}"
+          presentation:
+            type: header
+            name: X-Digits-Number
+          proxy_value: "{{.DigitsPlaceholder}}"
+          expires_at: {{.ExpiresAt}}
+          rules:
+            - host: "{{.Host}}"
+        - source:
+            type: file
+            path: "{{.DigitsPath}}"
+          presentation:
+            type: header
+            name: X-Digits-Word
+          proxy_value: "{{.WordPlaceholder}}"
+          expires_at: {{.ExpiresAt}}
+          rules:
+            - host: "{{.Host}}"
+
+# A matched MCP server on the declared host, so a protected JSON document
+# composes with the MCP response filter's read of the whole body.
+mcp:
+  servers:
+    - name: reflect
+      rules:
+        - host: "{{.Host}}"
+          paths: ["/mcp"]
+
+metrics:
+  listen: "127.0.0.1:0"
+
+log:
+  level: info
