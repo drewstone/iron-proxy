@@ -405,7 +405,7 @@ func attachScrub(req *http.Request, sec *resolvedSecret, value string, protected
 	}
 	state.values = append(state.values, value)
 	state.names = append(state.names, sec.source.Name())
-	askIdentity(req)
+	askGzip(req)
 }
 
 // Recheck the actual destination after routing and on every send, including retries.

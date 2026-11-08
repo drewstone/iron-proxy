@@ -323,6 +323,12 @@ func reflectingUpstream(t *testing.T, plain []byte, release <-chan struct{}) *ht
 			_, _ = io.WriteString(w, "data: {}\n\n")
 			w.(http.Flusher).Flush()
 			w.Header()[http.TrailerPrefix+nameReal] = []string{"1"}
+		case "/gzip-once":
+			if r.Header.Get("Accept-Encoding") != "gzip" {
+				t.Errorf("upstream was asked for %q, want gzip", r.Header.Get("Accept-Encoding"))
+			}
+			w.Header().Set("Content-Encoding", "gzip")
+			_, _ = w.Write(gzipped([]byte("stored=" + token(r))))
 		case "/gzip-two-lines":
 			w.Header()["Content-Encoding"] = []string{"identity", "gzip"}
 			_, _ = w.Write(gzipped([]byte(token(r))))
@@ -572,8 +578,24 @@ func TestIntegration_ResponseScrubCoversEveryReflectedEncoding(t *testing.T) {
 		requireNoName(t, "/trailer-late", resp, string(body))
 	})
 
-	t.Run("a compressed body the gate cannot see is refused", func(t *testing.T) {
-		for _, path := range []string{"/gzip-two-lines", "/gzip-twice", "/grpc"} {
+	t.Run("one gzip layer is decoded and scrubbed", func(t *testing.T) {
+		resp := throughProxy(t, httpAddr, upstreamAddr, "/gzip-once")
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, "stored="+reflectPlaceholder, string(body))
+	})
+
+	t.Run("a compressed body is decoded once and scrubbed, or refused", func(t *testing.T) {
+		// identity then gzip is one gzip layer, decoded and scrubbed.
+		resp := throughProxy(t, httpAddr, upstreamAddr, "/gzip-two-lines")
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, reflectPlaceholder, string(body))
+		// A second layer, or compressed gRPC messages, cannot be read.
+		for _, path := range []string{"/gzip-twice", "/grpc"} {
 			resp := throughProxy(t, httpAddr, upstreamAddr, path)
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()

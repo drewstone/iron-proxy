@@ -448,7 +448,7 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		if sec.scrubResponse {
 			// The response is read as text to remove the value, so the
 			// upstream must not compress it.
-			askIdentity(req)
+			askGzip(req)
 		}
 
 		name := sec.source.Name()

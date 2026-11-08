@@ -1,6 +1,7 @@
 package secrets
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/base32"
 	"encoding/base64"
@@ -980,10 +981,12 @@ func (s *Secrets) TransformResponse(ctx context.Context, tctx *transform.Transfo
 		resp.StatusCode < 200 || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified {
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}
-	// Bytes the proxy cannot read as text cannot be scrubbed. The request asked
-	// for identity, so net/http decodes nothing; any coding on any line, or
-	// gRPC or Connect message compression, is a host that compresses unasked.
-	if compressed(resp.Header) {
+	// Bytes the proxy cannot read as text cannot be scrubbed. The request
+	// asked for gzip itself, so net/http decodes nothing and every coding is
+	// seen here: one gzip layer is decoded below; any other coding or a second
+	// layer on any line, or gRPC or Connect message compression, is refused.
+	gzipped, ok := bodyCoding(resp.Header)
+	if !ok {
 		return refuseResponse(tctx, req, names, "response_encoding", "response encoding cannot be checked for a held secret\n"), nil
 	}
 
@@ -991,6 +994,11 @@ func (s *Secrets) TransformResponse(ctx context.Context, tctx *transform.Transfo
 	// whole response in memory first.
 	body := transform.RequireBufferedBody(resp.Body)
 	stream := body.StreamingReader()
+	if gzipped {
+		stream = &gunzipReader{src: stream}
+		resp.Header.Del("Content-Encoding")
+		resp.Uncompressed = true
+	}
 	closer, _ := stream.(io.Closer)
 	if closer == nil {
 		closer = body
@@ -1012,32 +1020,56 @@ func (s *Secrets) TransformResponse(ctx context.Context, tctx *transform.Transfo
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
 }
 
-// compressedFields name the codings a response body or its messages carry.
-var compressedFields = []string{"Content-Encoding", "Grpc-Encoding", "Connect-Content-Encoding"}
-
-// compressed reports a coding other than identity in any line of any field
-// that names one.
-func compressed(header http.Header) bool {
-	for _, field := range compressedFields {
+// bodyCoding reads every line of every field that names a coding of the body
+// or its messages. gzipped reports one gzip layer on the body; ok is false
+// for any other coding, a second layer, or compressed gRPC or Connect
+// messages.
+func bodyCoding(header http.Header) (gzipped, ok bool) {
+	var codings []string
+	for _, field := range []string{"Content-Encoding", "Grpc-Encoding", "Connect-Content-Encoding"} {
 		for _, line := range header.Values(field) {
 			for _, coding := range strings.Split(line, ",") {
 				if coding = strings.TrimSpace(coding); coding != "" && !strings.EqualFold(coding, "identity") {
-					return true
+					codings = append(codings, field+":"+strings.ToLower(coding))
 				}
 			}
 		}
 	}
-	return false
+	switch {
+	case len(codings) == 0:
+		return false, true
+	case len(codings) == 1 && (codings[0] == "Content-Encoding:gzip" || codings[0] == "Content-Encoding:x-gzip"):
+		return true, true
+	}
+	return false, false
 }
 
-// askIdentity makes a request whose response will be scrubbed ask for an
-// uncompressed body and uncompressed messages. With Accept-Encoding set,
-// net/http neither asks for gzip nor decodes a reply, so a coding it would
-// otherwise strip, hiding a second one beneath, stays visible to the gate.
-func askIdentity(req *http.Request) {
-	req.Header.Set("Accept-Encoding", "identity")
+// askGzip makes a request whose response will be scrubbed ask for gzip or no
+// coding, and for uncompressed messages. With Accept-Encoding set, net/http
+// neither adds its own nor decodes a reply, which would hide the coding of a
+// second layer beneath; the scrub decodes the one layer itself.
+func askGzip(req *http.Request) {
+	req.Header.Set("Accept-Encoding", "gzip")
 	req.Header.Del("Grpc-Accept-Encoding")
 	req.Header.Del("Connect-Accept-Encoding")
+}
+
+// gunzipReader decodes one gzip layer, starting at the first read so that
+// TransformResponse does not wait on the body.
+type gunzipReader struct {
+	src    io.Reader
+	reader *gzip.Reader
+	err    error
+}
+
+func (g *gunzipReader) Read(p []byte) (int, error) {
+	if g.reader == nil && g.err == nil {
+		g.reader, g.err = gzip.NewReader(g.src)
+	}
+	if g.err != nil {
+		return 0, g.err
+	}
+	return g.reader.Read(p)
 }
 
 // refuseResponse replaces a response the scrub cannot check with a 502 that
