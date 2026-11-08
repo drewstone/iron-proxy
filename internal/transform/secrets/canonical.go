@@ -8,11 +8,14 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
+	"github.com/ironsh/iron-proxy/internal/hostmatch"
 	"github.com/ironsh/iron-proxy/internal/transform"
 	"golang.org/x/net/http/httpguts"
 )
@@ -253,6 +256,9 @@ func (sec *resolvedSecret) swapCanonical(ctx context.Context, tctx *transform.Tr
 		return nil, nil
 	}
 	apply, location, err := sec.component(req)
+	if err == nil && apply == nil {
+		sec.scrubRedeemed(req)
+	}
 	if err != nil || apply == nil {
 		return nil, err
 	}
@@ -271,6 +277,61 @@ func (sec *resolvedSecret) swapCanonical(ctx context.Context, tctx *transform.Tr
 	return []string{location}, nil
 }
 
+// A grant's host keeps what it was sent: it can return a redeemed value in the
+// response to any later request, credentialed or not. Each grant therefore
+// remembers the values it redeemed, for the life of the process and across
+// reloads, and every response from a host its rules name is scrubbed of them.
+// Only values a host was actually sent are remembered; no source is resolved
+// for a request that redeems nothing.
+const maxRedeemedValues = 16
+
+var redeemedValues sync.Map // grant key -> *valueHistory
+
+type valueHistory struct {
+	mu     sync.Mutex
+	values []string // most recent last
+}
+
+func (sec *resolvedSecret) history() *valueHistory {
+	h, _ := redeemedValues.LoadOrStore(sec.source.Name()+"\x00"+sec.proxyValue, &valueHistory{})
+	return h.(*valueHistory)
+}
+
+func (h *valueHistory) add(value string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if i := slices.Index(h.values, value); i >= 0 {
+		h.values = slices.Delete(h.values, i, i+1)
+	}
+	h.values = append(h.values, value)
+	if len(h.values) > maxRedeemedValues {
+		h.values = h.values[len(h.values)-maxRedeemedValues:]
+	}
+}
+
+func (h *valueHistory) list() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.values)
+}
+
+// scrubRedeemed scrubs a response from a grant's host to a request that
+// redeems nothing of the values the grant redeemed before. The response is
+// not projected: it answers a request that carried no credential, and is
+// scrubbed as an ordinary response is.
+func (sec *resolvedSecret) scrubRedeemed(req *http.Request) {
+	if !sec.scrubResponse || sec.mode != "replace" {
+		return
+	}
+	host := strings.ToLower(hostmatch.StripPort(req.Host))
+	if !slices.ContainsFunc(sec.rules, func(rule hostmatch.Rule) bool { return rule.MatchesHost(host) }) {
+		return
+	}
+	for _, value := range sec.history().list() {
+		attachScrub(req, sec, value, false)
+	}
+}
+
 // Reverse mappings are private to this request; aliases and rotations cannot reselect a value.
 type scrubContextKey struct{}
 type requestScrubs struct {
@@ -278,13 +339,13 @@ type requestScrubs struct {
 	authority string
 	pairs     []scrubPair
 	names     []string
-	// values holds each canonical source value, used only to refuse a response
-	// header name that reflects one in the case-insensitive HTTP namespace.
+	// values holds each source value, used only to refuse a response field
+	// name that reflects one in the case-insensitive HTTP namespace.
 	values []string
 }
 
-// refuseCredentialHeaderNames reports a protected response whose header name
-// reflects a captured value. Go canonicalizes a response field name (the first
+// refuseCredentialHeaderNames reports a response whose header name reflects a
+// captured value. Go canonicalizes a response field name (the first
 // letter and each letter after a dash) before the case-sensitive value scrub
 // runs, so a lowercase credential used as a field name would otherwise pass;
 // names are matched case-insensitively here, while body and value matching
@@ -313,6 +374,16 @@ func rememberScrub(req *http.Request, sec *resolvedSecret, value string) {
 	if !sec.scrubResponse || sec.mode != "replace" {
 		return
 	}
+	if sec.presentation != nil {
+		sec.history().add(value)
+	}
+	attachScrub(req, sec, value, sec.presentation != nil)
+}
+
+// attachScrub adds value to the scrub of this request's response; protected
+// marks a value the request redeemed through a canonical grant, whose
+// response is projected (semantic.go).
+func attachScrub(req *http.Request, sec *resolvedSecret, value string, protected bool) {
 	state, _ := req.Context().Value(scrubContextKey{}).(*requestScrubs)
 	if state == nil {
 		state = &requestScrubs{}
@@ -325,16 +396,16 @@ func rememberScrub(req *http.Request, sec *resolvedSecret, value string) {
 		}
 		pairs = append([]scrubPair{{needle: encode(value), repl: encode(sec.proxyValue)}}, pairs...)
 	}
-	if sec.presentation != nil {
+	if protected {
 		state.canonical = append(state.canonical, sec)
 		state.authority = req.Host
 		state.pairs = append(pairs, state.pairs...)
-		state.values = append(state.values, value)
 	} else {
 		state.pairs = append(state.pairs, pairs...)
 	}
+	state.values = append(state.values, value)
 	state.names = append(state.names, sec.source.Name())
-	req.Header.Del("Accept-Encoding")
+	askIdentity(req)
 }
 
 // Recheck the actual destination after routing and on every send, including retries.

@@ -30,6 +30,9 @@ import (
 //     delta or transition is refused.
 //   - application/json and +json are one strict JSON value, passed on token
 //     by token under the same policy as an event payload (semantic_json.go).
+//     The strings at one place of the document, array positions aside, are
+//     one lane: a value split across them, as across the chunks of a model
+//     stream sent as a JSON array, is refused before its second part.
 //   - Record streams (NDJSON, JSON Lines, JSON text sequences) and a body
 //     with no media type are refused with a 502; a body proved empty passes.
 //   - Every other type keeps the byte scrub of an ordinary response.
@@ -77,7 +80,7 @@ func protectedBody(resp *http.Response, stream io.Reader, closer io.Closer, scru
 	}
 	switch {
 	case media == "text/event-stream":
-		sse := &sseProjector{scrub: scrub, lanes: map[string]*lane{}, facts: map[string]string{}}
+		sse := &sseProjector{scrub: scrub, lanes: map[string]*lane{}, facts: map[string]string{}, split: newSplitFence(scrub)}
 		return &scrubReader{src: stream, closer: closer, project: sse.project, strict: true, chunk: make([]byte, 32<<10)}, "sse"
 	case recordStream(media):
 		return nil, "record_stream"
@@ -135,7 +138,8 @@ type lanePart struct {
 
 // recordPlan is what one record does: the lane parts it continues, the
 // complete arguments it repeats with the fact they bind, the lanes it ends
-// (closes), the groups it ends for good and whether it ends the stream.
+// (closes), the groups it ends for good, whether it ends the stream and
+// whether it says the stream was cut off at its length limit.
 type recordPlan struct {
 	parts     []lanePart
 	arguments []*jsonValue
@@ -143,6 +147,7 @@ type recordPlan struct {
 	closes    func(*lane) bool
 	ended     []string
 	terminal  bool
+	truncated bool
 }
 
 func closeAll(*lane) bool { return true }
@@ -171,6 +176,18 @@ type sseProjector struct {
 	// size is the open event's bytes; argBytes those held by argument lanes.
 	size, argBytes int
 	event          sseEvent
+	// searched is how much of the unterminated line held from the last read
+	// was already searched for its end.
+	searched int
+	// truncating is set while a record that says the stream was cut off ends
+	// its lanes. unfinished are argument lanes that ended without one JSON
+	// value before the stream said so; the records from their end on wait in
+	// deferred until it does, or the stream is refused.
+	truncating bool
+	unfinished []*lane
+	deferred   []byte
+	// split fences values that are not one lane, such as log probabilities.
+	split *splitFence
 }
 
 // declare records an identity fact; a different value for it is a conflict.
@@ -202,16 +219,20 @@ func (p *sseProjector) known(key string) bool {
 }
 
 func (p *sseProjector) project(dst, data []byte, final bool) ([]byte, int, error) {
-	start := 0
+	// The held line was searched already; searching it again on every read
+	// would make a long line arriving in small reads quadratic.
+	start, from := 0, p.searched
+	searched := len(data)
 	for {
-		at := bytes.IndexAny(data[start:], "\r\n")
+		at := bytes.IndexAny(data[from:], "\r\n")
 		if at < 0 {
 			break
 		}
-		end := start + at
+		end := from + at
 		next := end + 1
 		if data[end] == '\r' {
 			if next == len(data) && !final {
+				searched = end
 				break
 			}
 			if next < len(data) && data[next] == '\n' {
@@ -222,13 +243,14 @@ func (p *sseProjector) project(dst, data []byte, final bool) ([]byte, int, error
 		if dst, err = p.line(dst, data[start:end]); err != nil {
 			return dst, 0, err
 		}
-		start = next
+		start, from = next, next
 	}
 	rest := len(data) - start
 	if p.size+rest > maxProtectedRecord {
 		return dst, 0, ErrResponseRefused
 	}
 	if !final {
+		p.searched = searched - start
 		return dst, rest, nil
 	}
 	// A model stream must reach its protocol's completion before a clean EOF;
@@ -293,6 +315,21 @@ func (p *sseProjector) line(dst, line []byte) ([]byte, error) {
 }
 
 func (p *sseProjector) dispatch(dst []byte) ([]byte, error) {
+	start := len(dst)
+	dst, err := p.dispatchEvent(dst)
+	if err != nil || len(p.unfinished) == 0 {
+		return dst, err
+	}
+	// Held until the stream says whether the unfinished arguments were cut
+	// off; comments and empty events, which carry nothing, still pass.
+	p.deferred = append(p.deferred, dst[start:]...)
+	if len(p.deferred) > maxProtectedRecord {
+		return dst[:start], ErrResponseRefused
+	}
+	return dst[:start], nil
+}
+
+func (p *sseProjector) dispatchEvent(dst []byte) ([]byte, error) {
 	ev := p.event
 	p.event, p.size = sseEvent{}, 0
 	if !ev.fields {
@@ -307,6 +344,9 @@ func (p *sseProjector) dispatch(dst []byte) ([]byte, error) {
 		var before []byte
 		var err error
 		if data == "[DONE]" {
+			if len(p.unfinished) > 0 {
+				return dst, ErrResponseRefused
+			}
 			p.terminal, p.doneSeen = true, true
 			before, err = p.flush(nil, closeAll)
 		} else {
@@ -351,6 +391,23 @@ func (p *sseProjector) record(ev sseEvent, data string) ([]byte, string, error) 
 	plan, err := p.classify(doc, ev)
 	if err != nil {
 		return nil, "", err
+	}
+	p.truncating = plan.truncated
+	defer func() { p.truncating = false }()
+	// A record that says the stream was cut off releases the arguments that
+	// ended unfinished, with the flat scrub, and the records that waited.
+	var released []byte
+	if plan.truncated && len(p.unfinished) > 0 {
+		for _, l := range p.unfinished {
+			out, _ := p.scrub.scan(nil, l.held, true)
+			p.argBytes -= len(l.held)
+			l.held = nil
+			if released, err = p.writeLane(released, l, out); err != nil {
+				return nil, "", err
+			}
+		}
+		released = append(released, p.deferred...)
+		p.unfinished, p.deferred = nil, nil
 	}
 	type replacement struct {
 		value *jsonValue
@@ -430,7 +487,7 @@ func (p *sseProjector) record(ev sseEvent, data string) ([]byte, string, error) 
 	if err != nil {
 		return nil, "", err
 	}
-	return before, final, nil
+	return append(released, before...), final, nil
 }
 
 // flush ends the open lanes closes selects, in the order they opened, and
@@ -442,25 +499,37 @@ func (p *sseProjector) flush(dst []byte, closes func(*lane) bool) ([]byte, error
 			continue
 		}
 		out, _, err := p.projectLane(l, l.held, true)
+		if errors.Is(err, errUnfinished) {
+			l.closed = true
+			p.unfinished = append(p.unfinished, l)
+			continue
+		}
 		if err != nil {
 			return dst, err
 		}
 		l.held, l.closed = nil, true
-		if len(out) == 0 {
-			continue
-		}
-		name, data := l.flush(string(out))
-		record, err := p.finish([]byte(data), "")
-		if err != nil {
+		if dst, err = p.writeLane(dst, l, out); err != nil {
 			return dst, err
 		}
-		ev := sseEvent{fields: true, data: []string{record}}
-		if l.named && name != "" {
-			ev.name, ev.hasName = name, true
-		}
-		dst = p.write(dst, ev, record)
 	}
 	return dst, nil
+}
+
+// writeLane writes a record that carries the rest of an ended lane's text.
+func (p *sseProjector) writeLane(dst []byte, l *lane, out []byte) ([]byte, error) {
+	if len(out) == 0 {
+		return dst, nil
+	}
+	name, data := l.flush(string(out))
+	record, err := p.finish([]byte(data), "")
+	if err != nil {
+		return dst, err
+	}
+	ev := sseEvent{fields: true, data: []string{record}}
+	if l.named && name != "" {
+		ev.name, ev.hasName = name, true
+	}
+	return p.write(dst, ev, record), nil
 }
 
 var anthropicEvents = map[string]bool{
@@ -586,6 +655,33 @@ func (p *sseProjector) chatPlan(doc jsonDoc) (recordPlan, error) {
 		switch {
 		case pathIs(path, "choices", c, "finish_reason"):
 			finished = append(finished, group)
+			plan.truncated = plan.truncated || v.str == "length"
+		case pathIn(path, "choices", c, "logprobs"):
+			// Log probabilities repeat the content a token at a time, with
+			// each token's bytes as numbers the scrub cannot read: a held value
+			// in one token, or split across tokens of one place, is refused.
+			if p.scrub.text(v.str) != v.str {
+				return plan, ErrResponseRefused
+			}
+			if err := p.split.next(group+":"+shapeOf(path[2:]), v.str); err != nil {
+				return plan, err
+			}
+		case pathIs(path, "choices", c, "delta", "reasoning_details", -1, "text"), pathIs(path, "choices", c, "delta", "reasoning_details", -1, "summary"):
+			// OpenRouter streams reasoning as details, each continued by its
+			// index; the text or summary of one index is a lane.
+			at := path[4].(int)
+			detail, ok := doc.get("choices", c, "delta", "reasoning_details", at, "index").index()
+			if !ok {
+				detail = at
+			}
+			kind, _ := doc.get("choices", c, "delta", "reasoning_details", at, "type").text()
+			plan.parts = append(plan.parts, lanePart{key: group + ":details:" + strconv.Itoa(detail) + ":" + field, group: group, field: field, value: v,
+				flush: flush(func(text string) string {
+					return `{"reasoning_details":[{"type":` + quote(kind) + `,"index":` + strconv.Itoa(detail) + "," + quote(field) + ":" + quote(text) + "}]}"
+				})})
+		case pathIn(path, "choices", c, "delta", "reasoning_details"):
+			// The type, format, id, signature and encrypted data of a detail
+			// are complete values; the record scrub covers them.
 		case pathIs(path, "choices", c, "native_finish_reason"), pathIs(path, "choices", c, "stop_reason"),
 			pathIs(path, "choices", c, "delta", "role"),
 			pathIs(path, "choices", c, "delta", "tool_calls", -1, "id"),
@@ -651,9 +747,15 @@ func (p *sseProjector) anthropicPlan(doc jsonDoc, typ string) (recordPlan, error
 	if !p.known("anthropic.message") {
 		return plan, ErrResponseRefused
 	}
+	// Tool input that ended unfinished is admitted only when the next event
+	// says the message stopped at its token limit.
+	stop, _ := doc.get("delta", "stop_reason").text()
+	if len(p.unfinished) > 0 && (typ != "message_delta" || stop != "max_tokens") {
+		return plan, ErrResponseRefused
+	}
 	switch typ {
 	case "message_delta":
-		plan.closes = closeAll
+		plan.closes, plan.truncated = closeAll, stop == "max_tokens"
 		return plan, p.declare("anthropic.ended", "")
 	case "message_stop":
 		plan.closes, plan.terminal = closeAll, true
@@ -778,7 +880,7 @@ func (p *sseProjector) responsesPlan(doc jsonDoc, typ string) (recordPlan, error
 	output, hasOutput := doc.get("output_index").index()
 	switch typ {
 	case "response.completed", "response.failed", "response.incomplete", "response.cancelled":
-		return recordPlan{closes: closeAll, terminal: true}, nil
+		return recordPlan{closes: closeAll, terminal: true, truncated: typ == "response.incomplete"}, nil
 	case "response.output_item.added":
 		id, ok := doc.get("item", "id").text()
 		kind, _ := doc.get("item", "type").text()

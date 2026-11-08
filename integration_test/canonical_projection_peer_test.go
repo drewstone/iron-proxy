@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
 )
 
@@ -48,6 +49,19 @@ func (peer *projectionPeer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if path == "/public/events" {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, publicEvents) // A write error is the client's to see.
+		return
+	}
+	if strings.HasPrefix(path, "/v1/recall-") {
+		// Answers a request with no credential with what the host was sent
+		// before, as a host that stores a credential can.
+		stored := *peer.current.Load()
+		if path == "/v1/recall-json" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"stored":"`+stored+`"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, "stored="+stored)
 		return
 	}
 	want, value := *peer.current.Load(), strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -162,9 +176,126 @@ func (peer *projectionPeer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"ok":true}`)
 	case path == "/mcp":
 		peer.writeUnbounded(w, value)
+	case strings.HasPrefix(path, "/v1/compat/"):
+		sse()
+		for _, ev := range compatEvents(slug, value) {
+			writeEvent(w, ev.name, ev.data)
+		}
+	case path == "/v1/trailer-name":
+		// A declared trailer named by the value, set after the body.
+		w.Header()["Trailer"] = []string{value}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+		w.Header()[value] = []string{"1"}
+	case path == "/v1/trailer-late":
+		// An undeclared trailer named by the value, after a whole chat stream.
+		sse()
+		writeEvent(w, "", chatChunk(`{"role":"assistant","content":"hi"}`, `"stop"`))
+		writeEvent(w, "", "[DONE]")
+		w.Header()[http.TrailerPrefix+value] = []string{"1"}
+	case path == "/v1beta/models/gemini:streamGenerateContent":
+		// A model stream sent as one JSON array, the value split across two
+		// of its chunks.
+		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+		writeRaw(w, `[{"candidates":[{"content":{"parts":[{"text":"key=`+value[:24]+`"}],"role":"model"},"index":0}]}`)
+		time.Sleep(2 * time.Millisecond)
+		writeRaw(w, ",\r\n"+`{"candidates":[{"content":{"parts":[{"text":"`+value[24:]+` end"}],"role":"model"},"index":0}]}]`)
+	case path == "/v1/list":
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, listDocument)
+	case path == "/v1/ws-split":
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for _, message := range []string{`{"type":"response.output_text.delta","delta":"key=` + value[:24] + `"}`, `{"type":"response.output_text.delta","delta":"` + value[24:] + ` end"}`, "after"} {
+			if conn.Write(r.Context(), websocket.MessageText, []byte(message)) != nil {
+				return
+			}
+		}
+		_, _, _ = conn.Read(r.Context())
+	case path == "/v1/slow":
+		// One long content event written in small flushes.
+		sse()
+		event := "data: " + chatChunk(`{"role":"assistant","content":"`+strings.Repeat("a", slowEventBytes)+`"}`, "null") + "\n\n"
+		for at := 0; at < len(event); at += slowFlushBytes {
+			_, _ = io.WriteString(w, event[at:min(at+slowFlushBytes, len(event))])
+			w.(http.Flusher).Flush()
+		}
+		writeEvent(w, "", chatChunk(`{}`, `"stop"`))
+		writeEvent(w, "", "[DONE]")
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+const (
+	slowEventBytes = 3 << 20
+	slowFlushBytes = 64
+)
+
+// listDocument is an ordinary JSON list of objects that holds no value.
+const listDocument = `[{"name":"one","text":"alpha"},{"name":"two","text":"beta"}]`
+
+func chatChunkWith(choice string) string {
+	return `{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[` + choice + `]}`
+}
+
+// compatEvents are valid model streams the projection must pass whole: chat
+// log probabilities, OpenRouter reasoning details, and tool calls cut off at
+// the length limit in each protocol. Reasoning and tool input carry the value.
+func compatEvents(slug, value string) []peerEvent {
+	logprob := func(token string) string {
+		return `{"token":"` + token + `","logprob":-0.1,"bytes":[104],"top_logprobs":[{"token":"` + token + `","logprob":-0.1,"bytes":[104]}]}`
+	}
+	detail := func(text string) string {
+		return chatChunk(`{"role":"assistant","content":"","reasoning":"`+text+`","reasoning_details":[{"type":"reasoning.text","text":"`+text+`","format":"anthropic-claude-v1","index":0}]}`, "null")
+	}
+	switch slug {
+	case "logprobs":
+		return []peerEvent{
+			{"", chatChunkWith(`{"index":0,"delta":{"role":"assistant","content":"Hello"},"logprobs":{"content":[` + logprob("Hello") + `],"refusal":null},"finish_reason":null}`)},
+			{"", chatChunkWith(`{"index":0,"delta":{"content":" world"},"logprobs":{"content":[` + logprob(" world") + `],"refusal":null},"finish_reason":null}`)},
+			{"", chatChunk(`{}`, `"stop"`)},
+			{"", "[DONE]"},
+		}
+	case "reasoning-details":
+		return []peerEvent{
+			{"", detail("think key=" + value[:12])},
+			{"", detail(value[12:])},
+			{"", chatChunk(`{"content":"done"}`, "null")},
+			{"", chatChunk(`{}`, `"stop"`)},
+			{"", "[DONE]"},
+		}
+	case "chat-tool-truncated":
+		return []peerEvent{
+			{"", chatChunk(`{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"token\":\"`+value[:16]+`"}}]}`, "null")},
+			{"", chatChunk(`{"tool_calls":[{"index":0,"function":{"arguments":"`+value[16:]+`"}}]}`, "null")},
+			{"", chatChunk(`{}`, `"length"`)},
+			{"", "[DONE]"},
+		}
+	case "anthropic-tool-truncated":
+		return []peerEvent{
+			messageStart,
+			blockEdge("content_block_start", 0, `{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}`),
+			blockDelta(0, "input_json_delta", "partial_json", `{\"token\": \"`+value[:20]),
+			blockDelta(0, "input_json_delta", "partial_json", value[20:]),
+			blockEdge("content_block_stop", 0, ""),
+			{"ping", `{"type":"ping"}`},
+			{"message_delta", `{"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":5}}`},
+			{"message_stop", `{"type":"message_stop"}`},
+		}
+	case "responses-incomplete":
+		return []peerEvent{
+			{"response.created", `{"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`},
+			itemAdded,
+			argumentsDelta("fc_1", 0, `{\"token\":\"`+value[:10]),
+			argumentsDelta("fc_1", 0, value[10:]),
+			{"response.incomplete", `{"type":"response.incomplete","response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`},
+		}
+	}
+	return nil
 }
 
 // jsonNumberDocument reflects a numeric credential in a numeric position, where

@@ -447,9 +447,8 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		}
 		if sec.scrubResponse {
 			// The response is read as text to remove the value, so the
-			// upstream must not compress it. net/http asks for gzip itself and
-			// decodes what comes back.
-			req.Header.Del("Accept-Encoding")
+			// upstream must not compress it.
+			askIdentity(req)
 		}
 
 		name := sec.source.Name()

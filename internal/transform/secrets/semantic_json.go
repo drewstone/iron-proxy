@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -51,6 +52,67 @@ type jsonPolicy struct {
 	keyBytes int
 	started  bool
 	done     bool
+	// split, when set, fences the strings a document repeats at one place.
+	split *splitFence
+}
+
+// splitFence refuses a held value split across the strings of one lane: the
+// first part has been sent and can no longer be replaced. For each lane it
+// keeps only the decoded end that may begin a match, bounded as scan's held
+// bytes, and all lanes together within one record's bound.
+type splitFence struct {
+	scrub    *scrubber
+	tails    map[string][]byte
+	size     int
+	buf, out []byte
+}
+
+// errSplitValue refuses a value split across strings of one lane.
+var errSplitValue = fmt.Errorf("%w: held value split across strings", ErrResponseRefused)
+
+func newSplitFence(scrub *scrubber) *splitFence {
+	return &splitFence{scrub: scrub, tails: map[string][]byte{}}
+}
+
+// next continues lane with s, which is sent once next returns.
+func (f *splitFence) next(lane, s string) error {
+	tail := f.tails[lane]
+	f.buf = append(append(f.buf[:0], tail...), s...)
+	var held int
+	var crossed bool
+	f.out, held, crossed = f.scrub.scanFenced(f.out[:0], f.buf, false, len(tail))
+	if crossed {
+		return errSplitValue
+	}
+	f.size -= len(tail)
+	if held == 0 {
+		delete(f.tails, lane)
+		return nil
+	}
+	if f.size+held > maxProtectedRecord {
+		return ErrResponseRefused
+	}
+	f.tails[lane] = append(tail[:0], f.buf[len(f.buf)-held:]...)
+	f.size += held
+	return nil
+}
+
+// shape names the place of the next token with array positions left out, so
+// each element's string at one place continues one lane; a key is named by
+// its object.
+func (j *jsonPolicy) shape() string {
+	var b strings.Builder
+	for i, f := range j.stack {
+		switch {
+		case !f.object:
+			b.WriteString("[]")
+		case i == len(j.stack)-1 && f.expectKey:
+			b.WriteString("{}")
+		default:
+			b.WriteString(quote(f.key))
+		}
+	}
+	return b.String()
 }
 
 // admit takes the next token, spelled raw, and returns the value it is or
@@ -61,8 +123,15 @@ func (j *jsonPolicy) admit(tok json.Token, raw []byte, index int) (jsonValue, bo
 		return jsonValue{}, false, ErrResponseRefused
 	}
 	j.started = true
-	if _, isString := tok.(string); isString && !validJSONString(raw) {
-		return jsonValue{}, false, ErrResponseRefused
+	if s, isString := tok.(string); isString {
+		if !validJSONString(raw) {
+			return jsonValue{}, false, ErrResponseRefused
+		}
+		if j.split != nil {
+			if err := j.split.next(j.shape(), s); err != nil {
+				return jsonValue{}, false, err
+			}
+		}
 	}
 	if delim, ok := tok.(json.Delim); ok && (delim == '}' || delim == ']') {
 		j.keyBytes -= j.stack[len(j.stack)-1].keyBytes
@@ -174,14 +243,33 @@ type jsonDocReader struct {
 	policy  jsonPolicy
 	raw     []byte // bytes read from src and not yet passed on
 	base    int64  // stream offset of raw[0]
+	// lenient passes the rest of a body that is not one JSON value on
+	// unchanged instead of refusing it; only a split value is refused.
+	lenient, passing bool
 }
 
 type readerFunc func([]byte) (int, error)
 
 func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
 
+// With scrub set, it also refuses a held value split across the strings at
+// one place of the document, such as the text of a model stream sent as a
+// JSON array of chunks.
 func newJSONDocReader(src io.Reader, scrub *scrubber) *jsonDocReader {
 	r := &jsonDocReader{src: src, policy: jsonPolicy{scrub: scrub}}
+	if scrub != nil {
+		r.policy.split = newSplitFence(scrub)
+	}
+	r.decoder = json.NewDecoder(readerFunc(r.fill))
+	r.decoder.UseNumber()
+	return r
+}
+
+// newJSONMessageReader fences the strings of a message that may be JSON with
+// split, which the messages of one stream share; a message that is not JSON
+// passes on unchanged once that is seen.
+func newJSONMessageReader(src io.Reader, split *splitFence) *jsonDocReader {
+	r := &jsonDocReader{src: src, policy: jsonPolicy{split: split}, lenient: true}
 	r.decoder = json.NewDecoder(readerFunc(r.fill))
 	r.decoder.UseNumber()
 	return r
@@ -198,6 +286,24 @@ func (r *jsonDocReader) fill(p []byte) (int, error) {
 }
 
 func (r *jsonDocReader) Read(p []byte) (int, error) {
+	n, err := r.read(p)
+	if err == nil || err == io.EOF || !r.lenient || errors.Is(err, errSplitValue) {
+		return n, err
+	}
+	// Not one JSON value: what was read passes on as it is, and the rest.
+	r.passing = true
+	return r.read(p)
+}
+
+func (r *jsonDocReader) read(p []byte) (int, error) {
+	if r.passing {
+		if len(r.raw) > 0 {
+			n := copy(p, r.raw)
+			r.raw = r.raw[n:]
+			return n, nil
+		}
+		return r.src.Read(p)
+	}
 	for {
 		if admitted := int(r.decoder.InputOffset() - r.base); admitted > 0 {
 			n := copy(p, r.raw[:admitted])
@@ -206,7 +312,7 @@ func (r *jsonDocReader) Read(p []byte) (int, error) {
 			// The whole document is bounded, not only each token, so a matched
 			// MCP server's io.ReadAll of a protected JSON body it composes with
 			// cannot be made to retain an unbounded aggregate.
-			if r.base > maxProtectedRecord {
+			if r.base > maxProtectedRecord && !r.lenient {
 				return 0, ErrResponseRefused
 			}
 			return n, nil
@@ -302,6 +408,19 @@ func (d jsonDoc) get(path ...any) *jsonValue {
 	return &d[at]
 }
 
+// shapeOf names a path with its array positions left out.
+func shapeOf(path []any) string {
+	var b strings.Builder
+	for _, step := range path {
+		if key, ok := step.(string); ok {
+			b.WriteString(quote(key))
+		} else {
+			b.WriteString("[]")
+		}
+	}
+	return b.String()
+}
+
 // pathIs reports a path equal to pattern, where an index of -1 matches any.
 func pathIs(path []any, pattern ...any) bool {
 	return len(path) == len(pattern) && pathIn(path, pattern...)
@@ -383,6 +502,11 @@ func (p *sseProjector) finish(record []byte, original string) (string, error) {
 // across every open argument lane, and projects it once the lane ends: no part
 // of an argument is sent before all of it is admitted. Every other lane is the
 // flat scrub.
+//
+// Arguments a stream cut off at its length limit are not one JSON value. When
+// the record that ends the lane says so, they take the flat scrub; when the
+// limit is declared only after the lane ends (Anthropic), the lane waits as
+// unfinished for that record (errUnfinished).
 func (p *sseProjector) projectLane(l *lane, text []byte, final bool) ([]byte, int, error) {
 	if !l.nested {
 		out, held := p.scrub.scan(nil, text, final)
@@ -395,13 +519,23 @@ func (p *sseProjector) projectLane(l *lane, text []byte, final bool) ([]byte, in
 		}
 		return nil, len(text), nil
 	}
-	p.argBytes -= len(text)
 	out, identity, err := projectArguments(p.scrub, text)
-	if err == nil && l.bind != "" {
+	switch {
+	case err != nil && p.truncating:
+		out, _ = p.scrub.scan(nil, text, true)
+		err = nil
+	case err != nil && p.facts["protocol"] == "anthropic":
+		return nil, len(text), errUnfinished
+	case err == nil && l.bind != "":
 		err = p.declare(l.bind, identity)
 	}
+	p.argBytes -= len(text)
 	return out, 0, err
 }
+
+// errUnfinished marks argument text that is not one JSON value when its lane
+// ends, before the stream has said whether it was cut off.
+var errUnfinished = errors.New("unfinished arguments")
 
 // projectArguments projects a tool call's complete arguments, JSON carried as
 // the text of a lane or of a done event. They are read under the strict policy

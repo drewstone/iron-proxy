@@ -921,7 +921,7 @@ func copyResponseHeaders(w http.ResponseWriter, resp *http.Response) {
 		w.Header().Del("Content-Length")
 	}
 	for name := range resp.Trailer {
-		w.Header().Add("Trailer", secrets.MaskResponseText(resp.Request, name))
+		w.Header().Add("Trailer", trailerName(resp, name))
 	}
 }
 
@@ -929,8 +929,20 @@ func copyResponseHeaders(w http.ResponseWriter, resp *http.Response) {
 // client after the body, via the TrailerPrefix convention.
 func writeTrailers(w http.ResponseWriter, resp *http.Response) {
 	for k, vs := range resp.Trailer {
+		name := trailerName(resp, k)
 		for _, v := range vs {
-			w.Header().Add(http.TrailerPrefix+secrets.MaskResponseText(resp.Request, k), secrets.MaskResponseText(resp.Request, v))
+			w.Header().Add(http.TrailerPrefix+name, secrets.MaskResponseText(resp.Request, v))
 		}
 	}
+}
+
+// trailerName masks a trailer name, and ends the response when the name
+// carries a held value: the body has been sent, so it cannot be refused with a
+// status, and the client must not take the response for a whole one.
+func trailerName(resp *http.Response, name string) string {
+	masked, ok := secrets.MaskResponseFieldName(resp.Request, name)
+	if !ok {
+		panic(http.ErrAbortHandler)
+	}
+	return masked
 }

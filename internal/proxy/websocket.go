@@ -112,6 +112,12 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request, clientRe
 	defer context.AfterFunc(p.shutdownCtx, finish)()
 	relay := func(dst, src *websocket.Conn, mask bool) {
 		defer finish()
+		// One mask for the direction, so a value split across messages is
+		// seen whole.
+		var messages *secrets.MessageMask
+		if mask {
+			messages = secrets.NewMessageMask(r)
+		}
 		for {
 			kind, reader, err := src.Reader(ctx)
 			if err != nil {
@@ -133,8 +139,8 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request, clientRe
 			if err != nil {
 				return
 			}
-			if mask {
-				reader = secrets.MaskResponseReader(r, reader)
+			if messages != nil {
+				reader = messages.Reader(reader, kind == websocket.MessageText)
 			}
 			_, copyErr := io.Copy(writer, reader)
 			closeErr := writer.Close()
