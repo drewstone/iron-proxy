@@ -1,6 +1,7 @@
 package secrets
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/base32"
 	"encoding/base64"
@@ -27,26 +28,37 @@ import (
 //     match: percent-encoding (either hex case), JSON escapes (\uXXXX in
 //     either case, surrogate pairs, \" \\ \/ \b \f \n \r \t), \xNN, HTML
 //     numeric references (decimal and hex) and the named references for
-//     & < > " '. Unicode format characters (category Cf, such as U+200B or
-//     U+FEFF), raw or escaped, may sit between characters of a match; up to
-//     maxGap of them per gap are skipped and the whole span is replaced.
+//     & < > " '. An ASCII character may be escaped twice, when an escape's
+//     own '%', '&' or '\' is escaped again (a URL escaped twice, an HTML
+//     reference inside JSON, JSON inside JSON). Unicode format characters
+//     (category Cf, such as U+200B or U+FEFF), raw or escaped, may sit between
+//     characters of a match; up to maxGap of them per gap are skipped and the
+//     whole span is replaced.
 //   - Transforms of the whole value, each matched through the escapes above:
 //     hex (either case), base64 in the standard and URL alphabets at all three
 //     alignments and base32 in the standard and hex alphabets (either case) at
 //     all five (padded or not, since only the characters that depend on the
-//     value alone are matched), the reversed value and rot13.
+//     value alone are matched), the reversed value and rot13. Hex, base64 and
+//     base32 may also be wrapped across lines: up to two line breaks (CR or LF,
+//     raw or escaped) count as one gap.
 //
 // A response to a request that redeemed a canonical secret is also projected
 // by its media type: a model stream that splits the value across records is
 // matched in the decoded text of each lane, and a stream format that cannot
 // be projected is refused (semantic.go).
 //
+// A value split across the messages of one WebSocket direction, or across the
+// strings at one path of a protected JSON document (array positions aside),
+// cannot be replaced once its first part is sent, so the connection or the
+// response is refused before the rest of it.
+//
 // Residual risk: the scrub catches reflection in these known encodings. A
 // declared host that applies any other reversible transform, such as
-// encryption, compression, splitting the value across responses or fields
-// that are not one lane, or base64 wrapped across lines, returns the value in
-// a form no scrub can recognise. A declared host therefore sits inside the
-// trust boundary: declare only hosts trusted with the value itself.
+// encryption, compression it does not declare, a byte list, or splitting the
+// value across responses or across fields that are not one lane, returns the
+// value in a form no scrub can recognise; a prefix of a value shorter than the
+// whole is not matched either. A declared host therefore sits inside the trust
+// boundary: declare only hosts trusted with the value itself.
 
 // minFragment is the shortest derived needle worth matching. A shorter run is
 // as likely to be ordinary text as part of an encoded secret.
@@ -56,9 +68,15 @@ const minFragment = 8
 // match. It bounds both the work per candidate and the bytes a stream holds.
 const maxGap = 16
 
-// maxToken is the longest encoding of one character the matcher reads: a
-// four-byte UTF-8 sequence percent-encoded, or a JSON surrogate pair.
-const maxToken = 12
+// maxToken is the longest encoding of one character the matcher reads: an
+// HTML reference whose '&' is itself an escaped reference, such as
+// "&#0000038;#1114111;" (a four-byte UTF-8 sequence percent-encoded and a JSON
+// surrogate pair are 12).
+const maxToken = 20
+
+// maxBreaks is how many line breaks one gap of a wrapped needle may hold: a
+// CRLF. Spaces and tabs after the break count toward maxGap.
+const maxBreaks = 2
 
 // scrubPair is one thing to find in a response and what replaces it.
 type scrubPair struct {
@@ -67,6 +85,9 @@ type scrubPair struct {
 	// fold matches ASCII letters in either case and writes the replacement in
 	// the case the match used. Hex and base32 set it.
 	fold bool
+	// wrap admits line breaks between characters, as encoders that wrap their
+	// output at a line length write them. Hex, base64 and base32 set it.
+	wrap bool
 }
 
 // scrubPairsFor lists the forms of one secret a response must not carry, each
@@ -76,7 +97,7 @@ func scrubPairsFor(realValue, placeholder string) []scrubPair {
 		return nil
 	}
 	pairs := []scrubPair{{needle: []byte(realValue), repl: []byte(placeholder)}}
-	derived := func(needle, repl string, fold bool) {
+	derived := func(needle, repl string, fold, wrap bool) {
 		if utf8.RuneCountInString(needle) < minFragment || repl == "" || needle == realValue {
 			return
 		}
@@ -85,20 +106,20 @@ func scrubPairsFor(realValue, placeholder string) []scrubPair {
 				return
 			}
 		}
-		pairs = append(pairs, scrubPair{needle: []byte(needle), repl: []byte(repl), fold: fold})
+		pairs = append(pairs, scrubPair{needle: []byte(needle), repl: []byte(repl), fold: fold, wrap: wrap})
 	}
-	derived(hex.EncodeToString([]byte(realValue)), hex.EncodeToString([]byte(placeholder)), true)
-	derived(reverse(realValue), reverse(placeholder), false)
-	derived(rot13(realValue), rot13(placeholder), false)
+	derived(hex.EncodeToString([]byte(realValue)), hex.EncodeToString([]byte(placeholder)), true, true)
+	derived(reverse(realValue), reverse(placeholder), false, false)
+	derived(rot13(realValue), rot13(placeholder), false, false)
 	for _, enc := range []*base64.Encoding{base64.RawStdEncoding, base64.RawURLEncoding} {
 		for pad := 0; pad < 3; pad++ {
-			derived(fragment(enc.EncodeToString, 6, realValue, pad), fragment(enc.EncodeToString, 6, placeholder, pad), false)
+			derived(fragment(enc.EncodeToString, 6, realValue, pad), fragment(enc.EncodeToString, 6, placeholder, pad), false, true)
 		}
 	}
 	for _, enc := range []*base32.Encoding{base32.StdEncoding, base32.HexEncoding} {
 		encode := func(b []byte) string { return strings.ToLower(enc.EncodeToString(b)) }
 		for pad := 0; pad < 5; pad++ {
-			derived(fragment(encode, 5, realValue, pad), fragment(encode, 5, placeholder, pad), true)
+			derived(fragment(encode, 5, realValue, pad), fragment(encode, 5, placeholder, pad), true, true)
 		}
 	}
 	return pairs
@@ -153,10 +174,13 @@ const (
 )
 
 // spelling is a form plus the hex case it used: 0 when it had no hex letter,
-// 'a' for lower, 'A' for upper.
+// 'a' for lower, 'A' for upper. outer, when not formLiteral, is how the
+// escape's own first byte ('%', '&' or '\\') was escaped again.
 type spelling struct {
-	form    form
-	hexCase byte
+	form      form
+	hexCase   byte
+	outer     form
+	outerCase byte
 }
 
 // needle is a scrubPair decoded to characters. Bytes that are not UTF-8 decode
@@ -165,6 +189,7 @@ type needle struct {
 	runes []rune
 	repl  []rune
 	fold  bool
+	wrap  bool
 	// literalEscape is set when the needle itself holds a character that
 	// starts an escape, so a literal reading must also be tried.
 	literalEscape bool
@@ -206,7 +231,7 @@ func newScrubber(pairs []scrubPair) *scrubber {
 		s.setRow(b)
 	}
 	for _, p := range pairs {
-		n := needle{runes: decodeRunes(p.needle), repl: decodeRunes(p.repl), fold: p.fold}
+		n := needle{runes: decodeRunes(p.needle), repl: decodeRunes(p.repl), fold: p.fold, wrap: p.wrap}
 		if len(n.runes) == 0 {
 			continue
 		}
@@ -229,10 +254,15 @@ func newScrubber(pairs []scrubPair) *scrubber {
 				s.setRow(lead)
 				continue
 			}
-			// The second character follows literally, escaped, or after a
-			// format character; the last two start with a non-letter byte.
+			// The second character follows literally, escaped, after a line
+			// break of a wrapped needle, or after a format character; the last
+			// two start with a non-letter byte.
 			for _, b1 := range []byte{byte(n.runes[1]), byte(unicode.ToUpper(n.runes[1])), '%', '\\', '&'} {
 				s.setPair(lead, b1)
+			}
+			if n.wrap {
+				s.setPair(lead, '\r')
+				s.setPair(lead, '\n')
 			}
 			for b1 := utf8.RuneSelf; b1 < 256; b1++ {
 				s.setPair(lead, byte(b1))
@@ -277,23 +307,50 @@ const (
 )
 
 // readToken decodes the character spelled at the start of data. escaped
-// selects whether escapes are read; when false, or when data starts with no
-// escape, the character is the literal UTF-8 rune. tokenMore means data ends
-// inside what may be a longer spelling and final is not set.
+// selects whether escapes are read, an ASCII character escaped twice
+// included; when false, or when data starts with no escape, the character is
+// the literal UTF-8 rune. tokenMore means data ends inside what may be a
+// longer spelling and final is not set.
 func readToken(data []byte, escaped, final bool) (rune, int, spelling, int) {
+	r, w, sp, st := readSingle(data, escaped, final)
+	if st != tokenOK || sp.form == formLiteral || !isEscapeStart(byte(r)) || r >= utf8.RuneSelf {
+		return r, w, sp, st
+	}
+	// The escape spelled '%', '&' or '\\': it may start a second escape whose
+	// remaining bytes follow it, as when an escaped value is escaped again.
+	var buf [maxToken]byte
+	buf[0] = byte(r)
+	n := copy(buf[1:], data[w:])
+	inner, iw, isp, more := readEscape(buf[:1+n])
+	switch {
+	case more && 1+n == len(buf):
+		// Longer than any second escape this reads.
+	case more && !final:
+		return 0, 0, spelling{}, tokenMore
+	case iw > 1 && inner < utf8.RuneSelf && isp.form != formLiteral:
+		isp.outer, isp.outerCase = sp.form, sp.hexCase
+		return inner, w + iw - 1, isp, tokenOK
+	}
+	return r, w, sp, st
+}
+
+// readEscape reads the escape at the start of data, if any.
+func readEscape(data []byte) (r rune, w int, sp spelling, more bool) {
+	switch data[0] {
+	case '%':
+		return readPercent(data)
+	case '\\':
+		return readBackslash(data)
+	case '&':
+		return readReference(data)
+	}
+	return 0, 0, spelling{}, false
+}
+
+// readSingle is readToken reading at most one layer of escape.
+func readSingle(data []byte, escaped, final bool) (rune, int, spelling, int) {
 	if escaped {
-		var r rune
-		var w int
-		var sp spelling
-		var more bool
-		switch data[0] {
-		case '%':
-			r, w, sp, more = readPercent(data)
-		case '\\':
-			r, w, sp, more = readBackslash(data)
-		case '&':
-			r, w, sp, more = readReference(data)
-		}
+		r, w, sp, more := readEscape(data)
 		if more && !final {
 			return 0, 0, spelling{}, tokenMore
 		}
@@ -382,7 +439,7 @@ func readPercent(data []byte) (rune, int, spelling, bool) {
 			if r == utf8.RuneError && w <= 1 {
 				break
 			}
-			return r, 3 * need, spelling{formPercent, hexCase}, false
+			return r, 3 * need, spelling{form: formPercent, hexCase: hexCase}, false
 		}
 	}
 	// One escaped byte that does not complete a UTF-8 sequence stands for
@@ -395,7 +452,7 @@ func readPercent(data []byte) (rune, int, spelling, bool) {
 	if value >= 0x80 {
 		r = unicode.MaxRune + 1 + r
 	}
-	return r, 3, spelling{formPercent, c}, false
+	return r, 3, spelling{form: formPercent, hexCase: c}, false
 }
 
 var jsonShort = map[byte]rune{'"': '"', '\\': '\\', '/': '/', 'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t'}
@@ -423,20 +480,20 @@ func readBackslash(data []byte) (rune, int, spelling, bool) {
 					if c == 0 {
 						c = c2
 					}
-					return 0x10000 + (r-0xD800)<<10 + rune(low-0xDC00), 12, spelling{formJSONU, c}, false
+					return 0x10000 + (r-0xD800)<<10 + rune(low-0xDC00), 12, spelling{form: formJSONU, hexCase: c}, false
 				}
 			}
 		}
-		return r, 6, spelling{formJSONU, c}, false
+		return r, 6, spelling{form: formJSONU, hexCase: c}, false
 	case 'x':
 		value, c, ok, more := readHex(data[2:], 2)
 		if !ok {
 			return 0, 0, spelling{}, more
 		}
-		return rune(value), 4, spelling{formHexEscape, c}, false
+		return rune(value), 4, spelling{form: formHexEscape, hexCase: c}, false
 	}
 	if r, ok := jsonShort[data[1]]; ok {
-		return r, 2, spelling{formJSONShort, 0}, false
+		return r, 2, spelling{form: formJSONShort, hexCase: 0}, false
 	}
 	return 0, 0, spelling{}, false
 }
@@ -456,7 +513,7 @@ func readReference(data []byte) (rune, int, spelling, bool) {
 				if !ok {
 					return 0, 0, spelling{}, false
 				}
-				return r, i + 1, spelling{formHTMLNamed, 0}, false
+				return r, i + 1, spelling{form: formHTMLNamed, hexCase: 0}, false
 			}
 			if data[i] < 'a' || data[i] > 'z' {
 				return 0, 0, spelling{}, false
@@ -477,7 +534,7 @@ func readReference(data []byte) (rune, int, spelling, bool) {
 			if i == digits || value > unicode.MaxRune {
 				return 0, 0, spelling{}, false
 			}
-			return rune(value), i + 1, spelling{f, hexCase}, false
+			return rune(value), i + 1, spelling{form: f, hexCase: hexCase}, false
 		}
 		if i-digits >= maxDigits {
 			return 0, 0, spelling{}, false
@@ -518,6 +575,7 @@ func (s *scrubber) matchAt(data []byte, i int, n *needle, escaped, final bool, s
 	spellings = spellings[:0]
 	at := i
 	for k, want := range n.runes {
+		breaks := 0
 		for gap := 0; ; gap++ {
 			if at >= len(data) {
 				if final {
@@ -533,32 +591,56 @@ func (s *scrubber) matchAt(data []byte, i int, n *needle, escaped, final bool, s
 				}
 			}
 			if equalRune(r, want, n.fold) {
-				if n.fold && r != want {
-					sp.hexCase = 'A'
-				} else if n.fold && unicode.IsLetter(r) {
-					sp.hexCase = 'a'
-				}
-				spellings = append(spellings, sp)
+				spellings = append(spellings, letterCase(sp, r, want, n.fold))
 				at += w
 				break
 			}
-			// The literal reading is tried byte by byte when an escape does
-			// not spell the wanted character.
+			// One layer of escape, then the literal byte, is tried when the
+			// longest reading does not spell the wanted character.
 			if escaped && w > 1 && sp.form != formLiteral {
-				lr, lw, lsp, _ := readToken(data[at:], false, true)
-				if equalRune(lr, want, n.fold) {
-					spellings = append(spellings, lsp)
-					at += lw
+				if fr, fw, fsp, ok := fallbackToken(data[at:], sp, want, n.fold, final); ok {
+					spellings = append(spellings, letterCase(fsp, fr, want, n.fold))
+					at += fw
 					break
 				}
 			}
-			if k == 0 || gap >= maxGap || !isGap(r) {
+			if r == '\r' || r == '\n' {
+				breaks++
+			}
+			// A wrapped needle's break may be followed by the indentation of
+			// the next line, as YAML blocks and indented PEM write it.
+			wrapGap := n.wrap && breaks > 0 && breaks <= maxBreaks && (r == '\r' || r == '\n' || r == ' ' || r == '\t')
+			if k == 0 || gap >= maxGap || !(isGap(r) || wrapGap) {
 				return 0, spellings, matchNone
 			}
 			at += w
 		}
 	}
 	return at, spellings, matchFound
+}
+
+// letterCase records, for a needle matched in either case, the case a letter
+// was written in, which its replacement keeps.
+func letterCase(sp spelling, got, want rune, fold bool) spelling {
+	if fold && got != want {
+		sp.hexCase = 'A'
+	} else if fold && unicode.IsLetter(got) {
+		sp.hexCase = 'a'
+	}
+	return sp
+}
+
+// fallbackToken reads the token at data as one layer of escape, when the
+// longest reading was two, and then as the literal byte, returning the first
+// reading that spells want.
+func fallbackToken(data []byte, longest spelling, want rune, fold, final bool) (rune, int, spelling, bool) {
+	if longest.outer != formLiteral {
+		if r, w, sp, st := readSingle(data, true, final); st == tokenOK && equalRune(r, want, fold) {
+			return r, w, sp, true
+		}
+	}
+	r, w, sp, _ := readSingle(data, false, true)
+	return r, w, sp, equalRune(r, want, fold)
 }
 
 func equalRune(got, want rune, fold bool) bool {
@@ -601,7 +683,18 @@ func encodeRepl(dst []byte, n *needle, spellings []spelling) []byte {
 		if n.fold && hexCase == 'A' {
 			r = unicode.ToUpper(r)
 		}
-		dst = spell(dst, r, sp.form, hexCase)
+		if sp.outer == formLiteral {
+			dst = spell(dst, r, sp.form, hexCase)
+			continue
+		}
+		// Escaped twice: the escape's first byte is escaped again as the
+		// match's was.
+		inner := spell(nil, r, sp.form, hexCase)
+		if len(inner) > 1 && isEscapeStart(inner[0]) {
+			dst = append(spell(dst, rune(inner[0]), sp.outer, sp.outerCase), inner[1:]...)
+		} else {
+			dst = append(dst, inner...)
+		}
 	}
 	return dst
 }
@@ -677,11 +770,25 @@ func spell(dst []byte, r rune, f form, hexCase byte) []byte {
 // trailing held bytes of data may be the start of a match that the next bytes
 // finish: they are not in out, and the caller carries them into the next
 // scan. A match of an n-character needle spans at most
-// n*maxToken + (n-1)*maxGap*maxToken bytes, which bounds held: 9,600 bytes
+// n*maxToken + (n-1)*maxGap*maxToken bytes, which bounds held: 15,999 bytes
 // for a 48-character secret.
 func (s *scrubber) scan(dst, data []byte, final bool) (out []byte, held int) {
+	out, held, _ = s.scanFenced(dst, data, final, 0)
+	return out, held
+}
+
+// scanFenced is scan for data whose first fence bytes were already sent: they
+// are not written to out and a match inside them is left as it was, while a
+// match that starts inside them and ends after them reports crossed, since its
+// first part can no longer be replaced.
+func (s *scrubber) scanFenced(dst, data []byte, final bool, fence int) (out []byte, held int, crossed bool) {
 	out = dst
 	emitted := 0
+	emit := func(to int) {
+		if from := max(emitted, fence); to > from {
+			out = append(out, data[from:to]...)
+		}
+	}
 	var spellings, best []spelling
 	for i := 0; i < len(data); i++ {
 		for i < len(data) && !s.mayStart(data, i) {
@@ -691,17 +798,27 @@ func (s *scrubber) scan(dst, data []byte, final bool) (out []byte, held int) {
 			break
 		}
 		bestEnd, bestNeedle, more := -1, -1, false
-		// Where an escape starts, both readings are tried: the escape, and
-		// the literal byte for a needle that itself holds that byte.
+		// Where an escape starts, each reading is tried: the longest escape,
+		// one layer of it when it was two, and the literal byte for a needle
+		// that itself holds that byte.
 		passes := 1
 		if isEscapeStart(data[i]) {
-			passes = 2
+			passes = 3
 		}
+		var longest spelling
 		for pass := 0; pass < passes; pass++ {
-			escaped := pass == 0
-			r, w, st := rune(data[i]), 1, tokenOK
-			if r >= utf8.RuneSelf || isEscapeStart(data[i]) {
-				r, w, _, st = readToken(data[i:], escaped, final)
+			escaped := pass < 2
+			r, w, sp, st := rune(data[i]), 1, spelling{}, tokenOK
+			switch {
+			case pass == 1 && longest.outer == formLiteral:
+				continue
+			case pass == 1:
+				r, w, sp, st = readSingle(data[i:], true, final)
+			case r >= utf8.RuneSelf || isEscapeStart(data[i]):
+				r, w, sp, st = readToken(data[i:], escaped, final)
+			}
+			if pass == 0 {
+				longest = sp
 			}
 			if st == tokenMore {
 				more = true
@@ -715,7 +832,8 @@ func (s *scrubber) scan(dst, data []byte, final bool) (out []byte, held int) {
 			}
 			for _, index := range s.startingWith(r) {
 				n := &s.needles[index]
-				if (!escaped && !n.literalEscape) || (next != 0 && len(n.runes) > 1 && !equalRune(rune(next), n.runes[1], n.fold)) {
+				if (!escaped && !n.literalEscape) || (next != 0 && len(n.runes) > 1 && !equalRune(rune(next), n.runes[1], n.fold) &&
+					!(n.wrap && (next == '\r' || next == '\n'))) {
 					continue
 				}
 				end, sp, result := s.matchAt(data, i, n, escaped, final, spellings)
@@ -736,18 +854,28 @@ func (s *scrubber) scan(dst, data []byte, final bool) (out []byte, held int) {
 		}
 		if more {
 			// A longer match may still complete; hold from here.
-			out = append(out, data[emitted:i]...)
-			return out, len(data) - i
+			emit(i)
+			return out, len(data) - i, false
 		}
 		if bestNeedle < 0 {
 			continue
 		}
-		out = append(out, data[emitted:i]...)
+		if i < fence {
+			if bestEnd > fence {
+				return out, 0, true
+			}
+			// Sent already, and replaced then if the scan saw it whole.
+			emitted = bestEnd
+			i = bestEnd - 1
+			continue
+		}
+		emit(i)
 		out = encodeRepl(out, &s.needles[bestNeedle], best)
 		emitted = bestEnd
 		i = bestEnd - 1
 	}
-	return append(out, data[emitted:]...), 0
+	emit(len(data))
+	return out, 0, false
 }
 
 func (s *scrubber) text(value string) string {
@@ -803,7 +931,11 @@ func (r *scrubReader) Read(p []byte) (int, error) {
 			continue
 		}
 		r.out, r.ready = out, out
-		r.pending = append(r.pending[:0], r.pending[len(r.pending)-held:]...)
+		if held < len(r.pending) {
+			// Moving a tail that is all of pending would copy it onto itself on
+			// every read, which small reads make quadratic.
+			r.pending = append(r.pending[:0], r.pending[len(r.pending)-held:]...)
+		}
 		if err != nil {
 			r.done, r.err = true, err
 		}
@@ -840,7 +972,9 @@ func (s *Secrets) TransformResponse(ctx context.Context, tctx *transform.Transfo
 	tctx.Annotate("secret_response_scrubbed", names)
 	scrub := newScrubber(pairs)
 
-	if len(state.canonical) > 0 && refuseCredentialHeaderNames(resp.Header, scrub, state.values) {
+	// Trailer names declared up front are checked here too; one that arrives
+	// only with the trailers is checked when it is written (MaskResponseFieldName).
+	if refuseCredentialHeaderNames(resp.Header, scrub, state.pairs) || refuseCredentialHeaderNames(resp.Trailer, scrub, state.pairs) {
 		return refuseResponse(tctx, req, names, "response_header_name", "response header name cannot be checked for a held secret\n"), nil
 	}
 
@@ -850,10 +984,12 @@ func (s *Secrets) TransformResponse(ctx context.Context, tctx *transform.Transfo
 		resp.StatusCode < 200 || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified {
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}
-	// Bytes the proxy cannot read as text cannot be scrubbed. The request had
-	// its Accept-Encoding removed, so net/http decodes gzip itself; any other
-	// encoding is a host that compresses unasked.
-	if encoding := resp.Header.Get("Content-Encoding"); encoding != "" && !strings.EqualFold(encoding, "identity") {
+	// Bytes the proxy cannot read as text cannot be scrubbed. The request
+	// asked for gzip itself, so net/http decodes nothing and every coding is
+	// seen here: one gzip layer is decoded below; any other coding or a second
+	// layer on any line, or gRPC or Connect message compression, is refused.
+	gzipped, ok := bodyCoding(resp.Header)
+	if !ok {
 		return refuseResponse(tctx, req, names, "response_encoding", "response encoding cannot be checked for a held secret\n"), nil
 	}
 
@@ -861,6 +997,11 @@ func (s *Secrets) TransformResponse(ctx context.Context, tctx *transform.Transfo
 	// whole response in memory first.
 	body := transform.RequireBufferedBody(resp.Body)
 	stream := body.StreamingReader()
+	if gzipped {
+		stream = &gunzipReader{src: stream}
+		resp.Header.Del("Content-Encoding")
+		resp.Uncompressed = true
+	}
 	closer, _ := stream.(io.Closer)
 	if closer == nil {
 		closer = body
@@ -880,6 +1021,58 @@ func (s *Secrets) TransformResponse(ctx context.Context, tctx *transform.Transfo
 	resp.Header.Del("Content-Length")
 	resp.ContentLength = -1
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
+}
+
+// bodyCoding reads every line of every field that names a coding of the body
+// or its messages. gzipped reports one gzip layer on the body; ok is false
+// for any other coding, a second layer, or compressed gRPC or Connect
+// messages.
+func bodyCoding(header http.Header) (gzipped, ok bool) {
+	var codings []string
+	for _, field := range []string{"Content-Encoding", "Grpc-Encoding", "Connect-Content-Encoding"} {
+		for _, line := range header.Values(field) {
+			for _, coding := range strings.Split(line, ",") {
+				if coding = strings.TrimSpace(coding); coding != "" && !strings.EqualFold(coding, "identity") {
+					codings = append(codings, field+":"+strings.ToLower(coding))
+				}
+			}
+		}
+	}
+	switch {
+	case len(codings) == 0:
+		return false, true
+	case len(codings) == 1 && (codings[0] == "Content-Encoding:gzip" || codings[0] == "Content-Encoding:x-gzip"):
+		return true, true
+	}
+	return false, false
+}
+
+// askGzip makes a request whose response will be scrubbed ask for gzip or no
+// coding, and for uncompressed messages. With Accept-Encoding set, net/http
+// neither adds its own nor decodes a reply, which would hide the coding of a
+// second layer beneath; the scrub decodes the one layer itself.
+func askGzip(req *http.Request) {
+	req.Header.Set("Accept-Encoding", "gzip")
+	req.Header.Del("Grpc-Accept-Encoding")
+	req.Header.Del("Connect-Accept-Encoding")
+}
+
+// gunzipReader decodes one gzip layer, starting at the first read so that
+// TransformResponse does not wait on the body.
+type gunzipReader struct {
+	src    io.Reader
+	reader *gzip.Reader
+	err    error
+}
+
+func (g *gunzipReader) Read(p []byte) (int, error) {
+	if g.reader == nil && g.err == nil {
+		g.reader, g.err = gzip.NewReader(g.src)
+	}
+	if g.err != nil {
+		return 0, g.err
+	}
+	return g.reader.Read(p)
 }
 
 // refuseResponse replaces a response the scrub cannot check with a 502 that
@@ -917,23 +1110,88 @@ func scrubHeaders(header http.Header, scrub *scrubber) {
 	}
 }
 
-// MaskResponseText uses only this request's selected source values, including after rotation.
-func MaskResponseText(req *http.Request, value string) string {
+func requestState(req *http.Request) *requestScrubs {
 	if req == nil {
-		return value
+		return nil
 	}
 	state, _ := req.Context().Value(scrubContextKey{}).(*requestScrubs)
+	return state
+}
+
+// MaskResponseText uses only this request's selected source values, including after rotation.
+func MaskResponseText(req *http.Request, value string) string {
+	state := requestState(req)
 	if state == nil {
 		return value
 	}
 	return newScrubber(state.pairs).text(value)
 }
 
-// MaskResponseReader preserves streaming and WebSocket message boundaries with bounded memory.
-func MaskResponseReader(req *http.Request, src io.Reader) io.Reader {
-	state, _ := req.Context().Value(scrubContextKey{}).(*requestScrubs)
+// MaskResponseFieldName masks a response field name, such as a trailer's that
+// arrives after the body. ok is false when the name carries a held value in
+// any letter case: Go canonicalizes field names before the case-sensitive
+// scrub sees them, so the response must be ended instead.
+func MaskResponseFieldName(req *http.Request, name string) (masked string, ok bool) {
+	state := requestState(req)
 	if state == nil {
-		return src
+		return name, true
 	}
-	return newScrubReader(src, nil, newScrubber(state.pairs))
+	scrub := newScrubber(state.pairs)
+	if refuseCredentialHeaderNames(http.Header{name: nil}, scrub, state.pairs) {
+		return "", false
+	}
+	return scrub.text(name), true
+}
+
+// MessageMask scrubs the messages of one direction of a WebSocket. A message
+// is delivered whole when it ends, so a match cannot be held across messages;
+// instead the end of each message that may begin a match is kept, and a
+// message that would complete it ends the relay with ErrResponseRefused
+// before the bytes that complete it are sent. The strings of text messages
+// that are JSON are fenced the same way, one lane for each place in a message
+// (array positions aside) across all messages, as a protected JSON document's
+// are. Memory is one 32 KiB read plus those tails, bounded as scan's held
+// bytes.
+type MessageMask struct {
+	scrub *scrubber
+	carry []byte
+	chunk []byte
+	split *splitFence
+}
+
+// NewMessageMask returns nil when the request holds nothing to scrub.
+func NewMessageMask(req *http.Request) *MessageMask {
+	state := requestState(req)
+	if state == nil || len(state.pairs) == 0 {
+		return nil
+	}
+	scrub := newScrubber(state.pairs)
+	return &MessageMask{scrub: scrub, chunk: make([]byte, 32<<10), split: newSplitFence(scrub)}
+}
+
+// Reader scrubs one message; read each to its end before the next.
+func (m *MessageMask) Reader(src io.Reader, text bool) io.Reader {
+	if text {
+		src = newJSONMessageReader(src, m.split)
+	}
+	fence := len(m.carry)
+	r := &scrubReader{src: src, chunk: m.chunk, pending: append([]byte(nil), m.carry...), strict: true}
+	r.project = func(dst, data []byte, final bool) ([]byte, int, error) {
+		out, held, crossed := m.scrub.scanFenced(dst, data, false, fence)
+		if !crossed && final {
+			// The message ends: what may begin a match is sent too, with
+			// every match it completes replaced, and kept to fence the next.
+			tail := data[len(data)-held:]
+			fence = max(0, fence-(len(data)-held))
+			out, _, crossed = m.scrub.scanFenced(out, tail, true, fence)
+			m.carry = append(m.carry[:0], tail...)
+			held = 0
+		}
+		if crossed {
+			return dst, 0, ErrResponseRefused
+		}
+		fence = max(0, fence-(len(data)-held))
+		return out, held, nil
+	}
+	return r
 }

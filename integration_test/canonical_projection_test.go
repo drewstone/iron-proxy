@@ -15,12 +15,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ironsh/iron-proxy/internal/cagen"
@@ -291,6 +293,131 @@ func TestCanonicalResponseProjection(t *testing.T) {
 	})
 }
 
+// TestCanonicalResponseProjectionReview drives the cases of the 2026-11-08
+// review through the same real TLS fixture: valid model streams the
+// projection must pass whole, responses to requests that redeem nothing,
+// trailer names, values split across the chunks of a JSON array or the
+// messages of a WebSocket, and a long event in small reads.
+func TestCanonicalResponseProjectionReview(t *testing.T) {
+	f := newProjectionFixture(t)
+	r1, client, send := f.r1, f.client, f.send
+
+	t.Run("valid model streams pass whole with their lanes projected", func(t *testing.T) {
+		for slug, end := range map[string]string{
+			"logprobs": "[DONE]", "reasoning-details": "[DONE]", "chat-tool-truncated": "[DONE]",
+			"anthropic-tool-truncated": "message_stop", "responses-incomplete": "response.incomplete",
+		} {
+			t.Run(slug, func(t *testing.T) {
+				resp, err := send("/v1/compat/"+slug, projectionBearer)
+				require.NoError(t, err)
+				defer resp.Body.Close()
+				require.Equal(t, http.StatusOK, resp.StatusCode)
+				body, err := io.ReadAll(resp.Body)
+				require.NoError(t, err, "the stream was cut short")
+				require.Contains(t, string(body), end)
+				requireAbsent(t, slug, string(body), r1)
+				if slug != "logprobs" {
+					require.True(t, strings.Contains(string(body), projectionPlaceholder), "%s lost the placeholder", slug)
+				}
+			})
+		}
+	})
+
+	t.Run("a response to a request that redeems nothing is scrubbed of what the grant redeemed", func(t *testing.T) {
+		resp, err := send("/v1/header-ordinary", projectionBearer)
+		require.NoError(t, err)
+		resp.Body.Close()
+		for _, path := range []string{"/v1/recall-json", "/v1/recall-text"} {
+			resp, err := send(path, nil)
+			require.NoError(t, err)
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, resp.StatusCode, path)
+			requireAbsent(t, path, string(body), r1)
+			require.True(t, strings.Contains(string(body), projectionPlaceholder), "%s lost the placeholder", path)
+		}
+	})
+
+	t.Run("a trailer name that carries the value is refused", func(t *testing.T) {
+		resp, err := send("/v1/trailer-name", projectionBearer)
+		requireRefused(t, resp, err, r1)
+
+		resp, err = send("/v1/trailer-late", projectionBearer)
+		if err == nil {
+			_, _ = io.ReadAll(resp.Body)
+			resp.Body.Close()
+			for name := range resp.Trailer {
+				requireAbsent(t, "trailer name", strings.ToLower(name), r1)
+			}
+		}
+	})
+
+	t.Run("a value split across the chunks of a JSON array is refused before it completes", func(t *testing.T) {
+		resp, err := send("/v1beta/models/gemini:streamGenerateContent", projectionBearer)
+		arrived := requireIncomplete(t, resp, err)
+		require.False(t, strings.Contains(textsOf(arrived), r1), "the split value arrived whole")
+
+		body := projectionBody(t, client, "/v1/list")
+		require.True(t, string(body) == listDocument, "an ordinary list changed")
+	})
+
+	t.Run("a value split across websocket messages never arrives whole", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		conn, _, err := websocket.Dial(ctx, "wss://"+projectionHost+"/v1/ws-split", &websocket.DialOptions{
+			HTTPClient: client,
+			HTTPHeader: http.Header{"Authorization": {"Bearer " + projectionPlaceholder}},
+		})
+		require.NoError(t, err)
+		defer conn.CloseNow()
+		var received strings.Builder
+		for {
+			_, message, err := conn.Read(ctx)
+			if err != nil {
+				break
+			}
+			received.Write(message)
+		}
+		require.False(t, strings.Contains(textsOf(received.String()), r1), "the split value arrived whole")
+		require.False(t, strings.Contains(received.String(), "after"), "the relay went on after the split value")
+	})
+
+	t.Run("a credentialed response is scrubbed of a value from before a rotation", func(t *testing.T) {
+		resp, err := send("/v1/header-ordinary", projectionBearer)
+		require.NoError(t, err)
+		resp.Body.Close()
+		f.peer.old.Store(&r1)
+		writeSource(t, f.sourcePath, f.r2)
+		f.peer.current.Store(&f.r2)
+		time.Sleep(10 * time.Millisecond)
+		body := projectionBody(t, client, "/v1/recall-old")
+		requireAbsent(t, "rotated value", string(body), r1)
+		require.True(t, strings.Contains(string(body), projectionPlaceholder), "the rotated value lost the placeholder")
+	})
+
+	t.Run("a long event in small reads is projected in linear time", func(t *testing.T) {
+		// Before the projector resumed its search, this event cost about 25 s
+		// of CPU; linear work leaves it well under the bound.
+		start := time.Now()
+		body := projectionBody(t, client, "/v1/slow")
+		require.Less(t, time.Since(start), 8*time.Second)
+		require.Greater(t, len(body), slowEventBytes)
+	})
+}
+
+var textField = regexp.MustCompile(`"(?:text|delta)":"([^"]*)"`)
+
+// textsOf joins the text and delta strings in text, in order, as a client
+// reassembling a model stream's text would.
+func textsOf(text string) string {
+	var b strings.Builder
+	for _, match := range textField.FindAllStringSubmatch(text, -1) {
+		b.WriteString(match[1])
+	}
+	return b.String()
+}
+
 // TestCanonicalResponseProjectionRefusals drives the header-name, invalid
 // projection, Responses part, clean-EOF, tool-argument and matched-MCP bound
 // cases through the same real TLS fixture.
@@ -484,12 +611,14 @@ func TestCanonicalResponseProjectionRefusals(t *testing.T) {
 	})
 }
 
+// projectionSecret is 48 hex characters that start with a letter, so Go's
+// canonical form of it as a field name differs from it.
 func projectionSecret(t *testing.T) string {
 	t.Helper()
 	raw := make([]byte, 24)
 	_, err := rand.Read(raw)
 	require.NoError(t, err)
-	return hex.EncodeToString(raw)
+	return "a" + hex.EncodeToString(raw)[1:]
 }
 
 // digitsSecret is a 30-digit decimal source value. Its first digit is 1-9, so
