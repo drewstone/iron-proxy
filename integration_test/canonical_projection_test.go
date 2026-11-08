@@ -383,6 +383,19 @@ func TestCanonicalResponseProjectionReview(t *testing.T) {
 		require.False(t, strings.Contains(received.String(), "after"), "the relay went on after the split value")
 	})
 
+	t.Run("a credentialed response is scrubbed of a value from before a rotation", func(t *testing.T) {
+		resp, err := send("/v1/header-ordinary", projectionBearer)
+		require.NoError(t, err)
+		resp.Body.Close()
+		f.peer.old.Store(&r1)
+		writeSource(t, f.sourcePath, f.r2)
+		f.peer.current.Store(&f.r2)
+		time.Sleep(10 * time.Millisecond)
+		body := projectionBody(t, client, "/v1/recall-old")
+		requireAbsent(t, "rotated value", string(body), r1)
+		require.True(t, strings.Contains(string(body), projectionPlaceholder), "the rotated value lost the placeholder")
+	})
+
 	t.Run("a long event in small reads is projected in linear time", func(t *testing.T) {
 		// Before the projector resumed its search, this event cost about 25 s
 		// of CPU; linear work leaves it well under the bound.

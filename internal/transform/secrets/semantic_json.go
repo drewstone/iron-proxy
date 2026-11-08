@@ -40,7 +40,16 @@ type jsonFrame struct {
 	value             int
 	keys              map[string]bool
 	keyBytes          int
+	// ident holds the identity members (type, ids and indexes) an object
+	// declared before its current member, so interleaved records of
+	// different streams keep different lanes.
+	ident string
 }
+
+// identityMembers name the members that tell one stream's records from
+// another's under the same keys, as in OpenAI Realtime or Responses events.
+var identityMembers = map[string]bool{"type": true, "event": true, "id": true, "item_id": true, "response_id": true,
+	"call_id": true, "index": true, "output_index": true, "content_index": true, "summary_index": true}
 
 // jsonPolicy admits exactly one JSON value token by token: valid UTF-8,
 // paired surrogate escapes, object keys unique after the request's
@@ -74,9 +83,14 @@ func newSplitFence(scrub *scrubber) *splitFence {
 	return &splitFence{scrub: scrub, tails: map[string][]byte{}}
 }
 
-// next continues lane with s, which is sent once next returns.
-func (f *splitFence) next(lane, s string) error {
-	tail := f.tails[lane]
+// next continues the lane laneOf names with s, which is sent once next
+// returns. The lane is named only when one holds a tail or s leaves one.
+func (f *splitFence) next(laneOf func() string, s string) error {
+	lane, tail := "", []byte(nil)
+	if len(f.tails) > 0 {
+		lane = laneOf()
+		tail = f.tails[lane]
+	}
 	f.buf = append(append(f.buf[:0], tail...), s...)
 	var held int
 	var crossed bool
@@ -84,32 +98,38 @@ func (f *splitFence) next(lane, s string) error {
 	if crossed {
 		return errSplitValue
 	}
-	f.size -= len(tail)
 	if held == 0 {
-		delete(f.tails, lane)
+		if tail != nil {
+			f.size -= len(tail)
+			delete(f.tails, lane)
+		}
 		return nil
 	}
-	if f.size+held > maxProtectedRecord {
-		return ErrResponseRefused
+	if lane == "" {
+		lane = laneOf()
 	}
+	if f.size-len(tail)+held > maxProtectedRecord {
+		// Too much to keep fenced is refused as a split would be.
+		return errSplitValue
+	}
+	f.size += held - len(tail)
 	f.tails[lane] = append(tail[:0], f.buf[len(f.buf)-held:]...)
-	f.size += held
 	return nil
 }
 
 // shape names the place of the next token with array positions left out, so
 // each element's string at one place continues one lane; a key is named by
-// its object.
+// its object, and each object by the identity members it declared first.
 func (j *jsonPolicy) shape() string {
 	var b strings.Builder
 	for i, f := range j.stack {
 		switch {
 		case !f.object:
-			b.WriteString("[]")
+			b.WriteString("\x00[]")
 		case i == len(j.stack)-1 && f.expectKey:
-			b.WriteString("{}")
+			b.WriteString("\x00{}" + f.ident)
 		default:
-			b.WriteString(quote(f.key))
+			b.WriteString("\x00" + f.ident + "\x01" + f.key)
 		}
 	}
 	return b.String()
@@ -128,7 +148,7 @@ func (j *jsonPolicy) admit(tok json.Token, raw []byte, index int) (jsonValue, bo
 			return jsonValue{}, false, ErrResponseRefused
 		}
 		if j.split != nil {
-			if err := j.split.next(j.shape(), s); err != nil {
+			if err := j.split.next(j.shape, s); err != nil {
 				return jsonValue{}, false, err
 			}
 		}
@@ -157,6 +177,14 @@ func (j *jsonPolicy) admit(tok json.Token, raw []byte, index int) (jsonValue, bo
 		}
 		v.parent = top.value
 		if top.object {
+			if identityMembers[top.key] && len(top.ident) < maxLaneMeta {
+				switch t := tok.(type) {
+				case string:
+					top.ident += top.key + "=" + t + ";"
+				case json.Number:
+					top.ident += top.key + "=" + string(t) + ";"
+				}
+			}
 			v.key, top.expectKey = top.key, true
 		} else {
 			v.pos = top.next
@@ -524,7 +552,7 @@ func (p *sseProjector) projectLane(l *lane, text []byte, final bool) ([]byte, in
 	case err != nil && p.truncating:
 		out, _ = p.scrub.scan(nil, text, true)
 		err = nil
-	case err != nil && p.facts["protocol"] == "anthropic":
+	case err != nil && (p.facts["protocol"] == "anthropic" || p.facts["protocol"] == "responses"):
 		return nil, len(text), errUnfinished
 	case err == nil && l.bind != "":
 		err = p.declare(l.bind, identity)

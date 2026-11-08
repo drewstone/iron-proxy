@@ -225,7 +225,7 @@ func htmlTemplate(value string) string {
 }
 
 // wrapped is base64 of prefix+value cut into lines as MIME (76, CRLF), PEM
-// (64, LF) and Ruby (60, LF) write it.
+// (64, LF) and Ruby (60, LF) write it, and indented as in a YAML block.
 func wrapped(value string) []string {
 	var out []string
 	for _, prefix := range []string{"", "u", "u:"} {
@@ -233,7 +233,7 @@ func wrapped(value string) []string {
 		for _, wrap := range []struct {
 			width int
 			eol   string
-		}{{76, "\r\n"}, {64, "\n"}, {60, "\n"}} {
+		}{{76, "\r\n"}, {64, "\n"}, {60, "\n"}, {64, "\n    "}} {
 			var b strings.Builder
 			for at := 0; at < len(encoded); at += wrap.width {
 				b.WriteString(encoded[at:min(at+wrap.width, len(encoded))] + wrap.eol)
@@ -246,7 +246,7 @@ func wrapped(value string) []string {
 
 // unwrapped removes the line breaks a wrapped or JSON-escaped body carries.
 func unwrapped(text string) string {
-	return strings.NewReplacer("\r", "", "\n", "", `\r`, "", `\n`, "").Replace(text)
+	return strings.NewReplacer("\r", "", "\n", "", `\r`, "", `\n`, "", " ", "").Replace(text)
 }
 
 func gzipped(data []byte) []byte {
@@ -312,6 +312,13 @@ func reflectingUpstream(t *testing.T, plain []byte, release <-chan struct{}) *ht
 			// Set directly so the fixture does not canonicalize the name.
 			w.Header()[nameToken(r)] = []string{"1"}
 			_, _ = io.WriteString(w, "ok")
+		case "/header-name-reversed", "/header-name-rot13":
+			name := reversed(nameToken(r))
+			if r.URL.Path == "/header-name-rot13" {
+				name = rot13(nameReal)
+			}
+			w.Header()[name] = []string{"1"}
+			_, _ = io.WriteString(w, "ok")
 		case "/trailer-name":
 			w.Header()["Trailer"] = []string{nameToken(r)}
 			_, _ = io.WriteString(w, "ok")
@@ -343,6 +350,25 @@ func reflectingUpstream(t *testing.T, plain []byte, release <-chan struct{}) *ht
 			w.Header().Set("Grpc-Encoding", "gzip")
 			frame := binary.BigEndian.AppendUint32([]byte{1}, uint32(len(message)))
 			_, _ = w.Write(append(frame, message...))
+		case "/ws-interleaved":
+			// Realtime-shaped deltas of two streams under one key.
+			value := token(r)
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.CloseNow()
+			for _, message := range []string{
+				`{"type":"response.audio_transcript.delta","delta":"key=` + value[:24] + `"}`,
+				`{"type":"response.audio.delta","delta":"UklGRiQAAABXQVZF"}`,
+				`{"type":"response.audio_transcript.delta","delta":"` + jsonString(false)(value[24:])[1:len(jsonString(false)(value[24:]))-1] + ` end"}`,
+				"after",
+			} {
+				if conn.Write(r.Context(), websocket.MessageText, []byte(message)) != nil {
+					return
+				}
+			}
+			_, _, _ = conn.Read(r.Context())
 		case "/ws-split":
 			value := token(r)
 			conn, err := websocket.Accept(w, r, nil)
@@ -563,12 +589,14 @@ func TestIntegration_ResponseScrubCoversEveryReflectedEncoding(t *testing.T) {
 	t.Run("a field name that carries a held value is refused", func(t *testing.T) {
 		// Go canonicalizes a field name before the case-sensitive scrub, so
 		// the name comes back case-folded; a lowercasing client recovers it.
-		for _, path := range []string{"/header-name", "/trailer-name"} {
+		for _, path := range []string{"/header-name", "/header-name-reversed", "/header-name-rot13", "/trailer-name"} {
 			resp := throughProxy(t, httpAddr, upstreamAddr, path)
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			require.Equal(t, http.StatusBadGateway, resp.StatusCode, path)
 			requireNoName(t, path, resp, string(body))
+			require.NotContains(t, strings.ToLower(fmt.Sprint(resp.Header)), reversed(nameReal), path)
+			require.NotContains(t, strings.ToLower(fmt.Sprint(resp.Header)), strings.ToLower(rot13(nameReal)), path)
 		}
 		// A trailer that arrives after the body ends the response unfinished.
 		resp := throughProxy(t, httpAddr, upstreamAddr, "/trailer-late")
@@ -605,24 +633,30 @@ func TestIntegration_ResponseScrubCoversEveryReflectedEncoding(t *testing.T) {
 	})
 
 	t.Run("a value split across websocket messages never arrives whole", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		conn, _, err := websocket.Dial(ctx, "ws://"+httpAddr+"/ws-split", &websocket.DialOptions{
-			Host:       upstreamAddr,
-			HTTPHeader: http.Header{"Authorization": {"Bearer " + reflectPlaceholder}, "X-Api-Key": {namePlaceholder}},
-		})
-		require.NoError(t, err)
-		defer conn.CloseNow()
-		var received strings.Builder
-		for {
-			_, message, err := conn.Read(ctx)
-			if err != nil {
-				break
+		for _, path := range []string{"/ws-split", "/ws-interleaved"} {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			conn, _, err := websocket.Dial(ctx, "ws://"+httpAddr+path, &websocket.DialOptions{
+				Host:       upstreamAddr,
+				HTTPHeader: http.Header{"Authorization": {"Bearer " + reflectPlaceholder}, "X-Api-Key": {namePlaceholder}},
+			})
+			require.NoError(t, err)
+			var received, texts strings.Builder
+			for {
+				_, message, err := conn.Read(ctx)
+				if err != nil {
+					break
+				}
+				received.Write(message)
+				var delta struct{ Type, Delta string }
+				if json.Unmarshal(message, &delta) == nil && strings.HasSuffix(delta.Type, "transcript.delta") {
+					texts.WriteString(delta.Delta)
+				}
 			}
-			received.Write(message)
+			conn.CloseNow()
+			cancel()
+			require.NotContains(t, received.String()+texts.String(), reflectReal, path)
+			require.NotContains(t, received.String(), "after", "%s: the relay went on after the split value", path)
 		}
-		require.NotContains(t, received.String(), reflectReal)
-		require.NotContains(t, received.String(), "after", "the relay went on after the split value")
 	})
 }
 

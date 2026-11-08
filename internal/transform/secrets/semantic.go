@@ -455,9 +455,16 @@ func (p *sseProjector) record(ev sseEvent, data string) ([]byte, string, error) 
 	// A record with complete arguments continues no lane, so its replacements
 	// stay in record order. Each copy and the item's argument lane declare one
 	// decoded identity as the bind fact, so a differing copy refuses unsent.
+	copyUnfinished := false
 	for _, v := range plan.arguments {
 		out, identity, err := projectArguments(p.scrub, []byte(v.str))
-		if err == nil {
+		switch {
+		case err != nil && (p.truncating || len(p.unfinished) > 0 || p.facts["protocol"] == "responses"):
+			// A copy of arguments that were cut off: the flat scrub, and
+			// held with them until the stream says so.
+			out, _ = p.scrub.scan(nil, []byte(v.str), true)
+			copyUnfinished, err = !p.truncating, nil
+		case err == nil:
 			err = p.declare(plan.bind, identity)
 		}
 		if err != nil {
@@ -470,6 +477,11 @@ func (p *sseProjector) record(ev sseEvent, data string) ([]byte, string, error) 
 		if before, err = p.flush(nil, plan.closes); err != nil {
 			return nil, "", err
 		}
+	}
+	// An unfinished copy is admitted only beside unfinished lane arguments,
+	// which hold it until the stream says it was cut off.
+	if copyUnfinished && len(p.unfinished) == 0 {
+		return nil, "", ErrResponseRefused
 	}
 	for _, group := range plan.ended {
 		delete(p.facts, "arguments:"+group) // An ended group keeps only its end.
@@ -663,7 +675,7 @@ func (p *sseProjector) chatPlan(doc jsonDoc) (recordPlan, error) {
 			if p.scrub.text(v.str) != v.str {
 				return plan, ErrResponseRefused
 			}
-			if err := p.split.next(group+":"+shapeOf(path[2:]), v.str); err != nil {
+			if err := p.split.next(func() string { return group + ":" + shapeOf(path[2:]) }, v.str); err != nil {
 				return plan, err
 			}
 		case pathIs(path, "choices", c, "delta", "reasoning_details", -1, "text"), pathIs(path, "choices", c, "delta", "reasoning_details", -1, "summary"):
@@ -750,12 +762,13 @@ func (p *sseProjector) anthropicPlan(doc jsonDoc, typ string) (recordPlan, error
 	// Tool input that ended unfinished is admitted only when the next event
 	// says the message stopped at its token limit.
 	stop, _ := doc.get("delta", "stop_reason").text()
-	if len(p.unfinished) > 0 && (typ != "message_delta" || stop != "max_tokens") {
+	cutOff := stop == "max_tokens" || stop == "model_context_window_exceeded"
+	if len(p.unfinished) > 0 && (typ != "message_delta" || !cutOff) {
 		return plan, ErrResponseRefused
 	}
 	switch typ {
 	case "message_delta":
-		plan.closes, plan.truncated = closeAll, stop == "max_tokens"
+		plan.closes, plan.truncated = closeAll, cutOff
 		return plan, p.declare("anthropic.ended", "")
 	case "message_stop":
 		plan.closes, plan.terminal = closeAll, true
@@ -878,6 +891,11 @@ func (p *sseProjector) responsesPlan(doc jsonDoc, typ string) (recordPlan, error
 	var plan recordPlan
 	item, hasItem := doc.get("item_id").text()
 	output, hasOutput := doc.get("output_index").index()
+	// Arguments that ended unfinished wait for the stream to say it was cut
+	// off; only the done events of what was open may come first.
+	if len(p.unfinished) > 0 && typ != "response.incomplete" && !strings.HasSuffix(typ, ".done") {
+		return plan, ErrResponseRefused
+	}
 	switch typ {
 	case "response.completed", "response.failed", "response.incomplete", "response.cancelled":
 		return recordPlan{closes: closeAll, terminal: true, truncated: typ == "response.incomplete"}, nil

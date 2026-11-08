@@ -142,9 +142,12 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request, clientRe
 			if messages != nil {
 				reader = messages.Reader(reader, kind == websocket.MessageText)
 			}
-			_, copyErr := io.Copy(writer, reader)
-			closeErr := writer.Close()
-			if copyErr != nil || closeErr != nil {
+			// A message cut short is not closed, which would send it as whole;
+			// the relay ends and drops the connection instead.
+			if _, err := io.Copy(writer, reader); err != nil {
+				return
+			}
+			if writer.Close() != nil {
 				return
 			}
 		}

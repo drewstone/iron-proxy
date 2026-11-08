@@ -75,7 +75,7 @@ const maxGap = 16
 const maxToken = 20
 
 // maxBreaks is how many line breaks one gap of a wrapped needle may hold: a
-// CRLF.
+// CRLF. Spaces and tabs after the break count toward maxGap.
 const maxBreaks = 2
 
 // scrubPair is one thing to find in a response and what replaces it.
@@ -607,7 +607,10 @@ func (s *scrubber) matchAt(data []byte, i int, n *needle, escaped, final bool, s
 			if r == '\r' || r == '\n' {
 				breaks++
 			}
-			if k == 0 || gap >= maxGap || !(isGap(r) || (n.wrap && breaks > 0 && breaks <= maxBreaks && (r == '\r' || r == '\n'))) {
+			// A wrapped needle's break may be followed by the indentation of
+			// the next line, as YAML blocks and indented PEM write it.
+			wrapGap := n.wrap && breaks > 0 && breaks <= maxBreaks && (r == '\r' || r == '\n' || r == ' ' || r == '\t')
+			if k == 0 || gap >= maxGap || !(isGap(r) || wrapGap) {
 				return 0, spellings, matchNone
 			}
 			at += w
@@ -971,7 +974,7 @@ func (s *Secrets) TransformResponse(ctx context.Context, tctx *transform.Transfo
 
 	// Trailer names declared up front are checked here too; one that arrives
 	// only with the trailers is checked when it is written (MaskResponseFieldName).
-	if refuseCredentialHeaderNames(resp.Header, scrub, state.values) || refuseCredentialHeaderNames(resp.Trailer, scrub, state.values) {
+	if refuseCredentialHeaderNames(resp.Header, scrub, state.pairs) || refuseCredentialHeaderNames(resp.Trailer, scrub, state.pairs) {
 		return refuseResponse(tctx, req, names, "response_header_name", "response header name cannot be checked for a held secret\n"), nil
 	}
 
@@ -1134,7 +1137,7 @@ func MaskResponseFieldName(req *http.Request, name string) (masked string, ok bo
 		return name, true
 	}
 	scrub := newScrubber(state.pairs)
-	if refuseCredentialHeaderNames(http.Header{name: nil}, scrub, state.values) {
+	if refuseCredentialHeaderNames(http.Header{name: nil}, scrub, state.pairs) {
 		return "", false
 	}
 	return scrub.text(name), true

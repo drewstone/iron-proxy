@@ -339,25 +339,25 @@ type requestScrubs struct {
 	authority string
 	pairs     []scrubPair
 	names     []string
-	// values holds each source value, used only to refuse a response field
-	// name that reflects one in the case-insensitive HTTP namespace.
-	values []string
 }
 
 // refuseCredentialHeaderNames reports a response whose header name reflects a
-// captured value. Go canonicalizes a response field name (the first
+// captured value in any of its forms. Go canonicalizes a response field name (the first
 // letter and each letter after a dash) before the case-sensitive value scrub
 // runs, so a lowercase credential used as a field name would otherwise pass;
 // names are matched case-insensitively here, while body and value matching
 // stays case sensitive. A name whose projection would collide with another
 // header's name, compared case-insensitively as HTTP names are and as the
 // forwarded header merges them, is refused too.
-func refuseCredentialHeaderNames(header http.Header, scrub *scrubber, values []string) bool {
+func refuseCredentialHeaderNames(header http.Header, scrub *scrubber, pairs []scrubPair) bool {
 	projected := make(map[string]bool, len(header))
 	for name := range header {
+		// Every form of a value the scrub matches in one case only is compared
+		// without case: canonicalization changes the case of any of them.
+		// Forms matched in either case (hex, base32) are projected below.
 		lower := strings.ToLower(name)
-		for _, value := range values {
-			if len(value) >= minFragment && strings.Contains(lower, strings.ToLower(value)) {
+		for _, p := range pairs {
+			if !p.fold && len(p.needle) >= minFragment && strings.Contains(lower, strings.ToLower(string(p.needle))) {
 				return true
 			}
 		}
@@ -374,10 +374,16 @@ func rememberScrub(req *http.Request, sec *resolvedSecret, value string) {
 	if !sec.scrubResponse || sec.mode != "replace" {
 		return
 	}
+	attachScrub(req, sec, value, sec.presentation != nil)
 	if sec.presentation != nil {
+		// The host may reflect a value it was sent before a rotation.
+		for _, earlier := range sec.history().list() {
+			if earlier != value {
+				attachScrub(req, sec, earlier, false)
+			}
+		}
 		sec.history().add(value)
 	}
-	attachScrub(req, sec, value, sec.presentation != nil)
 }
 
 // attachScrub adds value to the scrub of this request's response; protected
@@ -403,7 +409,6 @@ func attachScrub(req *http.Request, sec *resolvedSecret, value string, protected
 	} else {
 		state.pairs = append(state.pairs, pairs...)
 	}
-	state.values = append(state.values, value)
 	state.names = append(state.names, sec.source.Name())
 	askGzip(req)
 }

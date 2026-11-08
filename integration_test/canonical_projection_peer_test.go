@@ -33,6 +33,7 @@ import (
 // HTTP chunks, or breaks a protocol rule after reflecting it.
 type projectionPeer struct {
 	current *atomic.Pointer[string]
+	old     atomic.Pointer[string]
 	digits  string
 	stale   atomic.Int32
 	release chan struct{}
@@ -49,6 +50,13 @@ func (peer *projectionPeer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if path == "/public/events" {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, publicEvents) // A write error is the client's to see.
+		return
+	}
+	if path == "/v1/recall-old" {
+		// A credentialed request whose answer is a value the host was sent
+		// before the source rotated.
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, "stored="+*peer.old.Load())
 		return
 	}
 	if strings.HasPrefix(path, "/v1/recall-") {
@@ -292,6 +300,7 @@ func compatEvents(slug, value string) []peerEvent {
 			itemAdded,
 			argumentsDelta("fc_1", 0, `{\"token\":\"`+value[:10]),
 			argumentsDelta("fc_1", 0, value[10:]),
+			{"response.output_item.done", `{"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","status":"incomplete","call_id":"call_1","name":"lookup","arguments":"{\"token\":\"` + value + `"}}`},
 			{"response.incomplete", `{"type":"response.incomplete","response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`},
 		}
 	}
