@@ -119,6 +119,10 @@ func (peer *projectionPeer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case path == "/v1/untyped":
 		w.Header()["Content-Type"] = nil
 		_, _ = io.WriteString(w, value[:24]+"\n"+value[24:])
+	case path == "/v1/untyped-error":
+		w.Header()["Content-Type"] = nil
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, "limited for "+value)
 	case path == "/v1/candidates":
 		sse()
 		for _, part := range []string{value[:24], value[24:]} {
