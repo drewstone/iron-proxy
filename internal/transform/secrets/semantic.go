@@ -33,8 +33,8 @@ import (
 //     The strings at one place of the document, array positions aside, are
 //     one lane: a value split across them, as across the chunks of a model
 //     stream sent as a JSON array, is refused before its second part.
-//   - Record streams (NDJSON, JSON Lines, JSON text sequences) and a body
-//     with no media type are refused with a 502; a body proved empty passes.
+//   - Record streams (NDJSON, JSON Lines, JSON text sequences) are refused
+//     with a 502, as is a body with no media type unless empty or an error's.
 //   - Every other type keeps the byte scrub of an ordinary response.
 //
 // A refusal, or any failure reading a protected body, ends it with
@@ -69,8 +69,8 @@ func protectedBody(resp *http.Response, stream io.Reader, closer io.Closer, scru
 	values := resp.Header.Values("Content-Type")
 	if len(values) == 0 {
 		var probe [1]byte
-		if n, err := io.ReadFull(stream, probe[:]); n == 0 && errors.Is(err, io.EOF) {
-			return newScrubReader(stream, closer, scrub), "empty"
+		if n, err := io.ReadFull(stream, probe[:]); n == 0 && errors.Is(err, io.EOF) || resp.StatusCode >= 400 {
+			return newScrubReader(io.MultiReader(bytes.NewReader(probe[:n]), stream), closer, scrub), "untyped_message"
 		}
 		return nil, "untyped"
 	}

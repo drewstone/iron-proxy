@@ -250,23 +250,24 @@ func TestCanonicalResponseProjection(t *testing.T) {
 	t.Run("unsupported protected modes are refused before an unprojected byte", func(t *testing.T) {
 		cases := []struct {
 			name, path string
-			rejected   bool
+			status     int
 		}{
-			{name: "ndjson records", path: "/v1/records", rejected: true},
-			{name: "untyped body", path: "/v1/untyped", rejected: true},
+			{name: "ndjson records", path: "/v1/records", status: http.StatusBadGateway},
+			{name: "untyped body", path: "/v1/untyped", status: http.StatusBadGateway},
+			{name: "untyped error keeps its status, scrubbed", path: "/v1/untyped-error", status: http.StatusTooManyRequests},
 			{name: "unknown model event stream", path: "/v1/candidates"},
 			{name: "event stream labelled json", path: "/v1/mislabeled"},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
 				resp, err := send(tc.path, projectionBearer)
-				if !tc.rejected {
+				if tc.status == 0 {
 					requireAbsent(t, tc.name, requireIncomplete(t, resp, err), r2)
 					return
 				}
 				require.NoError(t, err)
 				defer resp.Body.Close()
-				require.Equal(t, http.StatusBadGateway, resp.StatusCode)
+				require.Equal(t, tc.status, resp.StatusCode)
 				body, err := io.ReadAll(resp.Body)
 				require.NoError(t, err)
 				requireAbsent(t, tc.name, string(body), r2)
@@ -308,12 +309,7 @@ func TestCanonicalResponseProjectionReview(t *testing.T) {
 			"anthropic-tool-truncated": "message_stop", "responses-incomplete": "response.incomplete",
 		} {
 			t.Run(slug, func(t *testing.T) {
-				resp, err := send("/v1/compat/"+slug, projectionBearer)
-				require.NoError(t, err)
-				defer resp.Body.Close()
-				require.Equal(t, http.StatusOK, resp.StatusCode)
-				body, err := io.ReadAll(resp.Body)
-				require.NoError(t, err, "the stream was cut short")
+				body := projectionBody(t, client, "/v1/compat/"+slug)
 				require.Contains(t, string(body), end)
 				requireAbsent(t, slug, string(body), r1)
 				if slug != "logprobs" {
