@@ -690,3 +690,46 @@ func gunzipAll(body []byte) string {
 	}
 	return string(body)
 }
+
+// A held value may legally equal a protocol word. The 101's handshake fields
+// carry that word in their names, but the proxy answers the client's handshake
+// itself, so the upgrade completes and the echoed value still arrives masked.
+func TestIntegration_ProtocolWordValueStillUpgrades(t *testing.T) {
+	const placeholder = "word-placeholder-0001"
+	t.Setenv("IRON_SCRUB_WORD_SECRET", "websocket")
+	factory, err := transform.Lookup("secrets")
+	require.NoError(t, err)
+	secrets, err := factory(mustYAMLNode(t, fmt.Sprintf(`
+secrets:
+  - source: {type: env, var: IRON_SCRUB_WORD_SECRET}
+    rules: [{host: "127.0.0.1"}]
+    replace:
+      proxy_value: %q
+      match_headers: [Authorization]
+      scrub_response: true
+`, placeholder)), testLogger())
+	require.NoError(t, err)
+	_, httpAddr, _, _ := startProxyWithTransforms(t, []transform.Transformer{secrets})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return // The client side reports a failed handshake.
+		}
+		defer conn.CloseNow()
+		_ = conn.Write(r.Context(), websocket.MessageText, []byte(r.Header.Get("Authorization"))) // The client side reports a lost message.
+	}))
+	defer upstream.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, resp, err := websocket.Dial(ctx, "ws://"+httpAddr+"/ws", &websocket.DialOptions{
+		Host:       upstream.Listener.Addr().String(),
+		HTTPHeader: http.Header{"Authorization": {"Bearer " + placeholder}},
+	})
+	require.NoError(t, err)
+	defer conn.CloseNow()
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	_, message, err := conn.Read(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "Bearer "+placeholder, string(message))
+}
