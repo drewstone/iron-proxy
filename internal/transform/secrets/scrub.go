@@ -974,7 +974,17 @@ func (s *Secrets) TransformResponse(ctx context.Context, tctx *transform.Transfo
 
 	// Trailer names declared up front are checked here too; one that arrives
 	// only with the trailers is checked when it is written (MaskResponseFieldName).
-	if refuseCredentialHeaderNames(resp.Header, scrub, state.pairs) || refuseCredentialHeaderNames(resp.Trailer, scrub, state.pairs) {
+	// A 101's handshake fields never reach the client: the WebSocket path drops
+	// them and answers the handshake itself, so a held value that is a protocol
+	// word ("websocket") must not refuse the upgrade.
+	header := resp.Header
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		header = header.Clone()
+		for _, name := range []string{"Connection", "Upgrade", "Sec-Websocket-Accept", "Sec-Websocket-Protocol", "Sec-Websocket-Extensions"} {
+			header.Del(name)
+		}
+	}
+	if refuseCredentialHeaderNames(header, scrub, state.pairs) || refuseCredentialHeaderNames(resp.Trailer, scrub, state.pairs) {
 		return refuseResponse(tctx, req, names, "response_header_name", "response header name cannot be checked for a held secret\n"), nil
 	}
 
