@@ -495,7 +495,17 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 	reqBody := transform.RequireBufferedBody(r.Body)
 	// Check Len() before StreamingReader(), which clears the original reader.
 	reqBodyLen := reqBody.Len()
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, io.NopCloser(reqBody.StreamingReader()))
+	// A buffered body reaches NewRequest as a *bytes.Reader, which gives the
+	// request a GetBody. net/http then resends it only where it knows upstream
+	// never processed it: a reused HTTP/1.1 connection that failed before any
+	// byte was written, or an HTTP/2 stream refused or past a GOAWAY (RFC 9113
+	// section 8.7). A request net/http would also resend after a write keeps
+	// an opaque body, so a POST that may have been processed is never resent.
+	upstreamBody := reqBody.StreamingReader()
+	if _, buffered := upstreamBody.(*bytes.Reader); !buffered || resentAfterWrite(r) {
+		upstreamBody = io.NopCloser(upstreamBody)
+	}
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, upstreamBody)
 	if err != nil {
 		result.Action = transform.ActionContinue
 		result.StatusCode = http.StatusBadGateway
@@ -865,6 +875,13 @@ func buildTransport(resolver *net.Resolver, guard *dnsguard.Guard, responseHeade
 	if responseHeaderTimeout <= 0 {
 		responseHeaderTimeout = config.DefaultUpstreamResponseHeaderTimeout
 	}
+	// IdleConnTimeout stays below Cloudflare's 400 s client-side idle limit
+	// (https://developers.cloudflare.com/fundamentals/reference/connection-limits/),
+	// so the pool never keeps a connection the edge closes for idleness. An edge
+	// can still drop a connection's state earlier and reset the next request,
+	// which for a POST is a 502 net/http cannot safely retry. The HTTP/2 ping
+	// after upstreamPingAfter without a frame finds such a connection and closes
+	// it before a request reuses it.
 	return &http.Transport{
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
@@ -876,9 +893,27 @@ func buildTransport(resolver *net.Resolver, guard *dnsguard.Guard, responseHeade
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
+		HTTP2:                 &http.HTTP2Config{SendPingTimeout: upstreamPingAfter},
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: responseHeaderTimeout,
 	}
+}
+
+// upstreamPingAfter bounds how long an HTTP/2 upstream connection the edge has
+// silently dropped stays in the pool. TCP keepalive probes carry no data, so
+// an edge that forgot the connection never answers them with a reset.
+const upstreamPingAfter = 5 * time.Second
+
+// resentAfterWrite mirrors net/http's Request.isReplayable: given a GetBody,
+// net/http resends these requests even after the request reached upstream.
+func resentAfterWrite(r *http.Request) bool {
+	switch r.Method {
+	case "", http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	}
+	_, key := r.Header["Idempotency-Key"]
+	_, xKey := r.Header["X-Idempotency-Key"]
+	return key || xKey
 }
 
 // markIfClientCancel records a client-initiated cancellation on result and
