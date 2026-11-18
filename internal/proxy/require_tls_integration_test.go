@@ -252,25 +252,10 @@ func TestIntegration_RequireTLS_PlainWebSocketUpgrade(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gotAuth := make(chan string, 1)
-			ln, err := net.Listen("tcp", "127.0.0.1:0")
-			require.NoError(t, err)
-			t.Cleanup(func() { _ = ln.Close() })
-			go func() {
-				conn, err := ln.Accept()
-				if err != nil {
-					return
-				}
-				defer conn.Close()
-				req, err := http.ReadRequest(bufio.NewReader(conn))
-				if err != nil {
-					return
-				}
-				gotAuth <- req.Header.Get("Authorization")
-				// Write errors surface as a failed upgrade on the client side.
-				_, _ = io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-			}()
-			target := ln.Addr().String()
+			matched := make(chan bool, 1)
+			target := startUpgradeObserver(t, func(req *http.Request) {
+				matched <- req.Header.Get("Authorization") == "Bearer "+tc.want
+			})
 
 			_, tunnelAddr, _ := startTunnelProxy(t, []transform.Transformer{newRequireTLSSecrets(t, "127.0.0.1", tc.requireTLS)})
 			conn, err := net.DialTimeout("tcp", tunnelAddr, 5*time.Second)
@@ -294,8 +279,8 @@ func TestIntegration_RequireTLS_PlainWebSocketUpgrade(t *testing.T) {
 			require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
 
 			select {
-			case got := <-gotAuth:
-				require.Equal(t, "Bearer "+tc.want, got)
+			case ok := <-matched:
+				require.True(t, ok, "upstream received the expected authorization")
 			case <-time.After(5 * time.Second):
 				t.Fatal("upstream did not receive the upgrade request")
 			}
