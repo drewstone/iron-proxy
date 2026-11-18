@@ -15,7 +15,7 @@ type privateRule struct {
 }
 
 func (r privateRule) matchesHTTP(req *http.Request, host string) bool {
-	return (r.Paths == nil || !strings.ContainsAny(req.URL.EscapedPath(), "%\\;")) && r.Matches(host, req.Method, req.URL.Path)
+	return (r.Paths == nil || !strings.ContainsAny(req.URL.EscapedPath(), "%\\;")) && r.MatchesRequestToHost(req, host)
 }
 func (a *Allowlist) PrivateIPs(req *http.Request) []netip.Prefix {
 	var prefixes []netip.Prefix
