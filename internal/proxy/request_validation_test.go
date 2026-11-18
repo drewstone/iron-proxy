@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ironsh/iron-proxy/internal/hostmatch"
@@ -224,25 +225,27 @@ func TestHTTPProxy_WebSocketRefusedUpgradeIsNotTunneled(t *testing.T) {
 	require.Equal(t, "blocked.example", recs[1].Host)
 }
 
-func TestHTTPProxy_WebSocketUsesOriginFormUpstream(t *testing.T) {
-	gotRequest := make(chan string, 1)
-	upstreamAddr := startRawUpstream(t, func(conn net.Conn, br *bufio.Reader) {
-		line, err := br.ReadString('\n')
+// startUpgradeObserver completes the real upstream WebSocket handshake and
+// reports only what the caller needs to check about the inbound request.
+func startUpgradeObserver(t *testing.T, observe func(*http.Request)) string {
+	t.Helper()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		observe(req)
+		conn, err := websocket.Accept(w, req, nil)
 		if err != nil {
+			t.Errorf("upstream WebSocket handshake: %v", err)
 			return
 		}
-		var hostHeader string
-		for {
-			h, err := br.ReadString('\n')
-			if err != nil || h == "\r\n" {
-				break
-			}
-			if strings.HasPrefix(strings.ToLower(h), "host:") {
-				hostHeader = strings.TrimSpace(h[len("host:"):])
-			}
-		}
-		gotRequest <- strings.TrimSpace(line) + " | " + hostHeader
-		_, _ = io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = conn.CloseNow()
+	}))
+	t.Cleanup(upstream.Close)
+	return upstream.Listener.Addr().String()
+}
+
+func TestHTTPProxy_WebSocketUsesOriginFormUpstream(t *testing.T) {
+	gotRequest := make(chan string, 1)
+	upstreamAddr := startUpgradeObserver(t, func(req *http.Request) {
+		gotRequest <- req.Method + " " + req.RequestURI + " " + req.Proto + " | " + req.Host
 	})
 
 	proxyAddr, _ := startAuditedProxy(t, nil)
@@ -253,7 +256,7 @@ func TestHTTPProxy_WebSocketUsesOriginFormUpstream(t *testing.T) {
 
 	// Absolute-form target: the upstream must still see origin-form with the
 	// policy-evaluated authority in Host.
-	_, err = fmt.Fprintf(conn, "GET http://%s/ws?x=1 HTTP/1.1\r\nHost: ignored.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n", upstreamAddr)
+	_, err = fmt.Fprintf(conn, "GET http://%s/ws?x=1 HTTP/1.1\r\nHost: ignored.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n", upstreamAddr)
 	require.NoError(t, err)
 	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	require.NoError(t, err)
