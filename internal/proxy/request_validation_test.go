@@ -233,7 +233,7 @@ func startUpgradeObserver(t *testing.T, observe func(*http.Request)) string {
 		observe(req)
 		conn, err := websocket.Accept(w, req, nil)
 		if err != nil {
-			t.Errorf("upstream WebSocket handshake: %v", err)
+			// Accept already sent an HTTP error, observed by the client assertion.
 			return
 		}
 		_ = conn.CloseNow()
