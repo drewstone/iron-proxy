@@ -238,6 +238,15 @@ func TestAllowlist_TunnelTargetMatchesInnerAuthority(t *testing.T) {
 	require.Equal(t, transform.ActionReject, request("api.openai.com:443", "api.openai.com:8443", true))
 }
 
+// The tunnel's CONNECT preflight is not TLS, so a require_tls allowlist rule
+// would make its host unreachable through the tunnel listener.
+func TestAllowlist_RejectsRequireTLS(t *testing.T) {
+	_, err := newFromConfig(allowlistConfig{
+		Rules: []hostmatch.RuleConfig{{Host: "api.openai.com", RequireTLS: true}},
+	})
+	require.ErrorContains(t, err, "allowlist: rules[0]: require_tls is not supported here")
+}
+
 func TestAllowlist_MethodsCaseInsensitive(t *testing.T) {
 	a, err := newFromConfig(allowlistConfig{
 		Rules: []hostmatch.RuleConfig{{

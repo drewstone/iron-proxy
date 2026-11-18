@@ -22,12 +22,12 @@ import (
 	"github.com/ironsh/iron-proxy/internal/certcache"
 	"github.com/ironsh/iron-proxy/internal/config"
 	"github.com/ironsh/iron-proxy/internal/dnsguard"
+	"github.com/ironsh/iron-proxy/internal/hostmatch"
 	"github.com/ironsh/iron-proxy/internal/mcp"
 	"github.com/ironsh/iron-proxy/internal/mcpgateway"
 	"github.com/ironsh/iron-proxy/internal/responseretry"
 	"github.com/ironsh/iron-proxy/internal/transform"
 	"github.com/ironsh/iron-proxy/internal/transform/secrets"
-	"golang.org/x/net/http2"
 )
 
 // Proxy is the HTTP/HTTPS proxy server. When Mode is TLSModeMITM, the HTTPS
@@ -135,15 +135,16 @@ func New(opts Options) *Proxy {
 	}
 
 	p.httpsServer = &http.Server{
-		Addr:    opts.HTTPSAddr,
-		Handler: http.HandlerFunc(p.handleDirectHTTP),
+		Addr:      opts.HTTPSAddr,
+		Handler:   http.HandlerFunc(p.handleDirectHTTP),
+		Protocols: new(http.Protocols),
 		TLSConfig: &tls.Config{
 			GetCertificate: p.getCertificate,
+			NextProtos:     []string{"h2", "http/1.1"},
 		},
 	}
-	// Enable HTTP/2 on the HTTPS listener (adds h2 to the TLS ALPN and serves
-	// negotiated conns through the existing handler); zero config never errors.
-	_ = http2.ConfigureServer(p.httpsServer, &http2.Server{})
+	p.httpsServer.Protocols.SetHTTP1(true)
+	p.httpsServer.Protocols.SetHTTP2(true)
 
 	return p
 }
@@ -297,6 +298,53 @@ func notReadyResponse() *http.Response {
 	}
 }
 
+// validateRequest rejects request shapes that policy and the upstream could
+// interpret differently. It returns a machine-readable reason for the audit
+// trace and a client-facing message, or ("", "") when r is acceptable.
+func (p *Proxy) validateRequest(r *http.Request) (reason, msg string) {
+	if r.Host == "" {
+		return "missing_host", "missing Host header"
+	}
+	// Only origin-form and absolute-form targets are supported. An opaque
+	// target (e.g. "http:http://other/") leaves URL.Host empty, so policy
+	// would run against the Host header while the serialized request line
+	// names a different authority.
+	if r.URL.Opaque != "" {
+		return "unsupported_request_target", "unsupported request target"
+	}
+	hostOnly := hostmatch.StripPort(r.Host)
+	if !hostmatch.IsCanonicalHost(hostOnly) {
+		return "non_canonical_host", "host must be ASCII and must not contain a zone identifier"
+	}
+	// Reject paths with "." or ".." segments. Policy rules (allowlist,
+	// secrets, etc.) match against the raw request path, but an upstream
+	// may canonicalize "/public/../admin" to "/admin" and serve a resource
+	// the rule was meant to protect. Rejecting up front avoids the gap.
+	if containsDotSegments(r.URL.Path) {
+		return "dot_segments", "path contains dot segments"
+	}
+	if r.TLS != nil && r.TLS.ServerName != hostOnly {
+		p.logger.Warn("SNI/Host mismatch",
+			slog.String("sni", r.TLS.ServerName),
+			slog.String("host", r.Host),
+		)
+		return "sni_host_mismatch", "SNI and Host header mismatch"
+	}
+	return "", ""
+}
+
+func markInvalidRequest(result *transform.PipelineResult, reason string) {
+	result.Action = transform.ActionReject
+	result.StatusCode = http.StatusBadRequest
+	result.RequestTransforms = append(result.RequestTransforms, transform.TransformTrace{
+		Name:   "request_validation",
+		Action: transform.ActionReject,
+		Annotations: map[string]any{
+			"reason": reason,
+		},
+	})
+}
+
 func (p *Proxy) handleDirectHTTP(w http.ResponseWriter, r *http.Request) {
 	p.handleHTTP(w, r, nil)
 }
@@ -310,35 +358,6 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 	}
 
 	host := r.Host
-	if host == "" {
-		http.Error(w, "missing Host header", http.StatusBadRequest)
-		return
-	}
-
-	// Reject paths with "." or ".." segments. Policy rules (allowlist,
-	// secrets, etc.) match against the raw request path, but an upstream
-	// may canonicalize "/public/../admin" to "/admin" and serve a resource
-	// the rule was meant to protect. Rejecting up front avoids the gap.
-	if containsDotSegments(r.URL.Path) {
-		http.Error(w, "path contains dot segments", http.StatusBadRequest)
-		return
-	}
-
-	// Validate SNI matches Host header on TLS connections
-	if r.TLS != nil {
-		hostOnly := r.Host
-		if h, _, err := net.SplitHostPort(hostOnly); err == nil {
-			hostOnly = h
-		}
-		if r.TLS.ServerName != hostOnly {
-			p.logger.Warn("SNI/Host mismatch",
-				slog.String("sni", r.TLS.ServerName),
-				slog.String("host", r.Host),
-			)
-			http.Error(w, "SNI and Host header mismatch", http.StatusBadRequest)
-			return
-		}
-	}
 
 	// Clone tunnelInfo so a transform that mutates the annotations map can't
 	// leak state into sibling requests that share the same tunnel.
@@ -362,6 +381,12 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 	}
 	pl, finish := p.beginPipelineRun(result)
 	defer finish()
+
+	if reason, msg := p.validateRequest(r); reason != "" {
+		markInvalidRequest(result, reason)
+		http.Error(w, msg, http.StatusBadRequest)
+		return
+	}
 
 	if !p.isReady() {
 		markNotReady(result)
@@ -436,7 +461,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 		}
 	}
 
-	// WebSocket upgrade: hijack and proxy bidirectionally
+	// Relay WebSocket messages only after the upstream accepts the upgrade.
 	if isWebSocketUpgrade(r) {
 		if clientUpgrade == nil {
 			http.Error(w, "invalid WebSocket upgrade", http.StatusBadRequest)
@@ -836,7 +861,7 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, resp *http.Response) {
 		// If a transform buffered the response body, set Content-Length
 		// from the buffered data. Otherwise preserve the upstream header
 		// as-is so clients that require Content-Length (e.g. Docker)
-		// work correctly.
+		// work correctly. A response with trailers stays chunked.
 		if n := buf.Len(); n >= 0 && len(resp.Trailer) == 0 {
 			w.Header().Set("Content-Length", strconv.FormatInt(int64(n), 10))
 		}
@@ -931,8 +956,12 @@ func markIfClientCancel(r *http.Request, err error, result *transform.PipelineRe
 }
 
 // containsDotSegments reports whether p has any "." or ".." path segment.
+// Backslash is treated as a separator (IIS, ASP.NET) and ";" path parameters
+// are ignored (Tomcat, Jetty, Spring), so "..\\" and "..;" are caught too.
 func containsDotSegments(p string) bool {
-	for _, seg := range strings.Split(p, "/") {
+	isSep := func(r rune) bool { return r == '/' || r == '\\' }
+	for _, seg := range strings.FieldsFunc(p, isSep) {
+		seg, _, _ = strings.Cut(seg, ";")
 		if seg == "." || seg == ".." {
 			return true
 		}

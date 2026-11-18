@@ -21,7 +21,6 @@ import (
 
 	"github.com/ironsh/iron-proxy/internal/config"
 	"github.com/ironsh/iron-proxy/internal/transform"
-	"golang.org/x/net/http2"
 )
 
 // listenTunnel starts the CONNECT/SOCKS5 tunnel listener.
@@ -409,6 +408,7 @@ func serveOneHTTPConn(conn net.Conn, handler http.Handler) error {
 	var hijacked atomic.Bool
 	var handlers sync.WaitGroup
 	srv := &http.Server{
+		Protocols: new(http.Protocols),
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			handlers.Add(1)
 			defer handlers.Done()
@@ -425,8 +425,8 @@ func serveOneHTTPConn(conn net.Conn, handler http.Handler) error {
 			}
 		},
 	}
-	// Serve HTTP/2 when a tunnelled conn negotiates it; zero config never errors.
-	_ = http2.ConfigureServer(srv, &http2.Server{})
+	srv.Protocols.SetHTTP1(true)
+	srv.Protocols.SetHTTP2(true)
 	err := srv.Serve(ln)
 	// A hijacking handler (WebSocket relay, CONNECT tunnel) owns the
 	// connection until it returns. Serve comes back as soon as the hijack
